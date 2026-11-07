@@ -50,7 +50,7 @@ release (the alpha versions before it, 2.0–2.0.14, aren't kept).
 
 `tools/buildcheck` builds the app's sources with the same dependencies as
 `app/build.gradle` and runs the Robolectric tests in `tools/buildcheck/tests`
-(32 service tests, 10 streaming tests, 21 screenshot tests →
+(33 service tests, 10 streaming tests, 21 screenshot tests →
 `tools/buildcheck/app/build/shots`, 7 against a real Navidrome, skipped
 unless one is running: `tools/navidrome/README.md`, and 33 with the car's own
 launcher — 7 of them with SmartTube too — skipped unless their APKs are
@@ -238,6 +238,10 @@ are the main thread here.
 - Start-up **always plays**, however the music was left at switch-off (the
   car pauses it itself when switched off, and the launcher then asks for
   "paused").  Only the "Don't play anything" setting, or another app
-  already playing, keeps it quiet.
+  already playing, keeps it quiet.  If the launcher doesn't ask, the app
+  starts it itself 25 s after BootReceiver's signal — unless the launcher
+  has been in touch this start-up (it asks what the app can play as it
+  starts): then it's bringing back another source, e.g. the radio left
+  paused at switch-off, and the app leaves it.
 - Failed scrobbles are queued and retried (`PendingScrobbles`).
 - The log shows how each start-up went ("Startup timing: …").

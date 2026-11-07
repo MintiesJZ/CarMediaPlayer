@@ -398,6 +398,8 @@ class MediaService : MediaBrowserServiceCompat() {
     private var bootFallbackJob: Job? = null
     /** When BootReceiver last told us the head unit started (elapsedRealtime). */
     private var bootSignalAt = 0L
+    /** When the launcher last sent us anything (elapsedRealtime), -1 if never. */
+    private var launcherHeardAt = -1L
 
     // Timing of this start-up, for the log ("Startup timing: …").  traceFrom
     // is when the head unit started (elapsedRealtime); -1 = not timing.  On
@@ -2107,6 +2109,7 @@ class MediaService : MediaBrowserServiceCompat() {
      */
     private fun handleLauncherCommand(command: CommandParcelable) {
         Log.i(TAG, "Launcher: $command")
+        launcherHeardAt = SystemClock.elapsedRealtime()
         if (command.event != CommandParcelable.UPDATE_SOURCE_AVAILABLE) {
             lastTransportCommandAt = SystemClock.elapsedRealtime()
         }
@@ -2182,8 +2185,9 @@ class MediaService : MediaBrowserServiceCompat() {
     /**
      * Sent by BootReceiver.  Normally the launcher asks for us (above); if it
      * hasn't within [BOOT_FALLBACK_MS], start the music ourselves — but
-     * never over another app that's already playing (e.g. the radio, if the
-     * launcher went back to it).
+     * never over another app that's already playing, nor when the launcher's
+     * been in touch this start-up: then it's bringing back another source
+     * (the radio, say, paused as the car left it), which the driver chose.
      */
     private fun scheduleBootFallback() {
         if (startupHandled || bootFallbackJob != null) return
@@ -2196,6 +2200,12 @@ class MediaService : MediaBrowserServiceCompat() {
             val saved = resumeStore.load()
             Log.i(TAG, "Startup (launcher didn't ask): mode=$mode, last queue=${saved?.kind}")
             if (mode == PlaybackSettings.StartupMode.NOTHING) return@launch
+            // This start-up: since boot, or since we were woken from sleep.
+            val startedAt = if (bootSignalAt > STARTUP_WINDOW_MS) bootSignalAt else 0L
+            if (launcherHeardAt >= startedAt) {
+                Log.i(TAG, "Startup: the launcher's bringing back another source — leaving it")
+                return@launch
+            }
             if (player.playWhenReady) return@launch
             traceAuto = true
             if (player.mediaItemCount > 0) {

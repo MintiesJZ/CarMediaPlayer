@@ -319,6 +319,22 @@ class ServiceTest {
         assertTrue(s.player().playWhenReady)
     }
 
+    /**
+     * The launcher asked what we can play but brought back another source
+     * (the radio, paused as the car left it): the music stays quiet.
+     * (LauncherStartupTest does it with the launcher's code.)
+     */
+    @Test
+    fun bootFallbackLeavesAnotherSourceTheLauncherBroughtBack() {
+        savePlayingState()
+        val s = service()
+        s.onStartCommand(launcherCommand(CommandParcelable.UPDATE_SOURCE_AVAILABLE), 0, 1)
+        waitFor { s.player().mediaItemCount > 0 }
+        s.onStartCommand(Intent(app, MediaService::class.java).setAction(MediaService.ACTION_BOOT_START), 0, 2)
+        idle(30_000)
+        assertFalse(s.player().playWhenReady)
+    }
+
     @Test
     fun networkProblemsAreWaitedOutOtherErrorsAreNot() {
         val policy = com.saicmotor.media.service.WaitForNetworkPolicy()
