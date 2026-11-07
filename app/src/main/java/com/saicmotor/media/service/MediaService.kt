@@ -489,6 +489,8 @@ class MediaService : MediaBrowserServiceCompat() {
 
     /** Pauses / stops so far: a launcher "play" still waiting (see SessionCallback.onPlay) is dropped by a later one. */
     private var pauseCommands = 0
+    /** A launcher "play" waiting to see whether it came with a volume change. */
+    private var waitingLauncherPlay: Job? = null
 
     /** When the driver last paused the music: its sound takes a moment to stop. */
     private var lastUserPauseAt = -1L
@@ -1507,9 +1509,18 @@ class MediaService : MediaBrowserServiceCompat() {
                 PlayCause.CENTRE_KEY -> centreKeyPlay(from)
                 PlayCause.VOLUME     -> Log.i(TAG, "  → ignored: that was the volume being changed")
                 PlayCause.NOT_KNOWN  -> {
+                    // Another while one waits: the launcher's play/pause
+                    // button tapped again (it still saw "paused"), so this
+                    // tap is the pause.
+                    if (waitingLauncherPlay?.isActive == true) {
+                        waitingLauncherPlay?.cancel()
+                        waitingLauncherPlay = null
+                        Log.i(TAG, "  → a second tap: stays paused")
+                        return
+                    }
                     // Give the key or volume change a moment to show up.
                     val pausesBefore = pauseCommands
-                    serviceScope.launch {
+                    waitingLauncherPlay = serviceScope.launch {
                         delay(VOLUME_PLAY_WAIT_MS)
                         when {
                             // Paused since: the later command wins.

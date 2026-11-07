@@ -50,10 +50,11 @@ release (the alpha versions before it, 2.0–2.0.14, aren't kept).
 
 `tools/buildcheck` builds the app's sources with the same dependencies as
 `app/build.gradle` and runs the Robolectric tests in `tools/buildcheck/tests`
-(31 service tests, 10 streaming tests, 21 screenshot tests →
+(32 service tests, 10 streaming tests, 21 screenshot tests →
 `tools/buildcheck/app/build/shots`, 7 against a real Navidrome, skipped
-unless one is running: `tools/navidrome/README.md`, and 15 with the car's own
-launcher, skipped unless its APK is given: `tools/firmware/README.md`).
+unless one is running: `tools/navidrome/README.md`, and 33 with the car's own
+launcher — 7 of them with SmartTube too — skipped unless their APKs are
+given: `tools/firmware/README.md`).
 Needs JDK 17, Gradle 8.x, Android SDK platform 34 + build-tools 34
 (`local.properties` with `sdk.dir=...`).
 
@@ -89,16 +90,24 @@ source (`tools/navidrome`), through a `Relay` that can break, slow or cut off
 the connection.  Run it with `--rerun` (Gradle doesn't notice the
 environment) and a freshly started server (empty transcoding cache).
 
-`LauncherWheelTest` runs the SAIC launcher's own steering-wheel code
-(SwcManager, ModeManager's key handling, VolumeManager, SAIC's car API),
-converted from the firmware's Launcher APK with dex2jar at test time
-(`FIRMWARE_LAUNCHER_APK`; SAIC's code never goes in the repo).  `LauncherCode`
-loads it with stack map frames worked out (dex2jar's are missing) and empty
-stand-ins for SAIC's additions to Android.  The launcher gets the same key
-reports as the app, sends the app's session its commands through an Android
-MediaController (delivered on the main thread; its state is the one the app
-last set), and turns a stand-in car audio service, decoded with the
-firmware's own interface constants.  Its work thread is the main thread here.
+`LauncherWheelTest` and `LauncherStartupTest` run other apps' own code,
+converted from their APKs with dex2jar at test time (`FIRMWARE_LAUNCHER_APK`,
+`SMARTTUBE_APK`; that code never goes in the repo): the SAIC launcher's
+steering-wheel code (SwcManager, ModeManager's key handling, VolumeManager,
+SAIC's car API), its now-playing tile's model (MediaModel) and its start-up
+restore (ScreenStateMachine, LastModeManager, SAIC's CommandParcelable); and
+SmartTube's player (ExoPlayer 2.10) and media session, without its screens.
+`ApkCode` loads each app's classes as its own copies, with stack map frames
+worked out (dex2jar's are missing) and empty stand-ins for SAIC's additions
+to Android.  Stood in for: Android connecting sessions (`SessionBridge`:
+commands on the main thread; state and metadata passed on), passing audio
+focus (`AudioFocusStack`) and delivering startService intents between apps
+(re-parcelled, so SAIC's CommandParcelable and the app's must agree), the
+car's audio service (decoded with the firmware's own interface constants),
+and the home screen / power "ready" events.  Android finds an app's service
+for the launcher in manifest order (Robolectric sorts by name): MediaService
+must stay the first service in the manifest.  The other apps' work threads
+are the main thread here.
 
 ## How the car talks to the app (learned from the firmware)
 
@@ -128,8 +137,10 @@ firmware's own interface constants.  Its work thread is the main thread here.
   press if the session isn't PLAYING.  So a launcher "play" while paused is
   judged by the latest key reported (`launcherPlayCause`): the centre key →
   acted on at once (if it waited, a quick second press saw "paused" and sent
-  "play" again); a volume change → ignored; neither → wait 250 ms for a late
-  report, and a pause that comes meanwhile drops it (`pauseCommands`).  For
+  "play" again); a volume change → ignored; neither (e.g. the launcher's
+  play/pause button) → wait 250 ms for a late report, and a pause that
+  comes meanwhile drops it (`pauseCommands`), as does another "play" (the
+  button tapped again, `waitingLauncherPlay`).  For
   ~1 s after a pause the music's own sound is still fading out, so it doesn't
   count as another app playing (`OWN_SOUND_FADE_MS`).
   Holding left/right: the launcher sends fastForward/rewind then
@@ -159,7 +170,10 @@ firmware's own interface constants.  Its work thread is the main thread here.
   only the bitmap + DISPLAY_ICON_URI.  Any state other than PLAYING (3) shows
   as paused, so buffering while playWhenReady is reported as PLAYING at speed 0.
 - Other apps (YouTube) keep priority: external "play" is blocked while
-  another session is playing.
+  another session is playing.  This needs SmartTube's defaults: "Audio
+  focus" on (else it doesn't take the speakers and the music plays on under
+  the video) and "Disable playback notifications" off (else its session is
+  inactive and the app can't see it).
 - **Radio** (the mode key): the radio takes audio focus, so the music pauses
   where it was; the launcher's "switch source" (32769) brings it back.  The
   look-ahead downloader finishes the song it's on but starts no new one until

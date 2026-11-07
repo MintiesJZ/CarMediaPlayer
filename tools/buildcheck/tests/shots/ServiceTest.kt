@@ -731,6 +731,27 @@ class ServiceTest {
         s.callerForTest = null
     }
 
+    /**
+     * Quick taps on the launcher's play/pause button (no key reports with
+     * them): it sends "play" each time while the music still shows paused, so
+     * the second is the pause.  (LauncherWheelTest does it with the launcher's code.)
+     */
+    @Test
+    fun quickTapsOfTheLaunchersButtonEachCount() {
+        savePlayingState()
+        val s = service()
+        s.restoredByLauncher(CommandParcelable.SWITCH_SOURCE_ONLY_PAUSE)
+        s.call("userPause")
+        idle(1_500)
+        val launcher = sessionCallback(s)
+        s.callerForTest = "com.saicmotor.launcher"
+        launcher.onPlay(); idle(150); launcher.onPlay(); idle(500)
+        assertFalse("played then paused", s.player().playWhenReady)
+        launcher.onPlay(); idle(500)
+        assertTrue("a tap on its own plays", s.player().playWhenReady)
+        s.callerForTest = null
+    }
+
     /** Navidrome too busy for a cover ("429"): asked again a moment later, then given up on. */
     @Test
     fun busyCoverRequestsAreAskedAgain() {
