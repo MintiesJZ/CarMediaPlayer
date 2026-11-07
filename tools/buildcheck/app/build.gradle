@@ -20,7 +20,7 @@ def smartTubeJar = layout.buildDirectory.file('smarttube/smarttube.jar')
 android {
     namespace 'com.saicmotor.media'
     compileSdk 34
-    defaultConfig { applicationId "com.saicmotor.media"; minSdk 27; targetSdk 28; versionCode 2000000029; versionName "1.0.11" }
+    defaultConfig { applicationId "com.saicmotor.media"; minSdk 27; targetSdk 28; versionCode 2000000030; versionName "1.0.12" }
     compileOptions { sourceCompatibility JavaVersion.VERSION_1_8; targetCompatibility JavaVersion.VERSION_1_8 }
     kotlinOptions { jvmTarget = '1.8' }
     buildFeatures { viewBinding true }
