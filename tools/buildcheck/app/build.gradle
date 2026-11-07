@@ -13,6 +13,10 @@ def SRC = new File(rootDir, '../../app/src/main').canonicalPath
 // SAIC's, so it never goes in the repo (see tools/firmware/README.md).
 def launcherApk = System.getenv('FIRMWARE_LAUNCHER_APK')
 def launcherJar = layout.buildDirectory.file('launcher/launcher.jar')
+// SmartTube (the YouTube app used in the car), for the tests with a video
+// open: converted when SMARTTUBE_APK points at its APK.
+def smartTubeApk = System.getenv('SMARTTUBE_APK')
+def smartTubeJar = layout.buildDirectory.file('smarttube/smarttube.jar')
 android {
     namespace 'com.saicmotor.media'
     compileSdk 34
@@ -32,6 +36,12 @@ android {
                     dependsOn 'launcherJar'
                     systemProperty 'launcher.jar', launcherJar.get().asFile.path
                 }
+                if (smartTubeApk) {
+                    dependsOn 'smartTubeJar'
+                    systemProperty 'smarttube.jar', smartTubeJar.get().asFile.path
+                }
+                // The app's manifest, in its own order (LauncherStartupTest).
+                systemProperty 'app.manifest', new File(SRC, 'AndroidManifest.xml').path
             }
         }
     }
@@ -72,4 +82,12 @@ tasks.register('launcherJar', JavaExec) {
     args '--force', '--output', launcherJar.get().asFile.path, launcherApk ?: 'none'
     inputs.property 'apk', launcherApk ?: ''
     outputs.file launcherJar
+}
+tasks.register('smartTubeJar', JavaExec) {
+    onlyIf { smartTubeApk }
+    classpath = configurations.dex2jar
+    mainClass = 'com.googlecode.dex2jar.tools.Dex2jarCmd'
+    args '--force', '--output', smartTubeJar.get().asFile.path, smartTubeApk ?: 'none'
+    inputs.property 'apk', smartTubeApk ?: ''
+    outputs.file smartTubeJar
 }

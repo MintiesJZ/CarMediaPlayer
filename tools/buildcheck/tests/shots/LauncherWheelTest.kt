@@ -5,21 +5,15 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.media.MediaFormat
+import android.media.MediaMetadata
 import android.media.session.MediaController
-import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Binder
-import android.os.Bundle
-import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.Parcel
 import android.os.SystemClock
 import android.provider.Settings
-import android.support.v4.media.session.IMediaControllerCallback
-import android.support.v4.media.session.IMediaSession
-import android.support.v4.media.session.MediaSessionCompat
-import android.support.v4.media.session.PlaybackStateCompat
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -73,20 +67,28 @@ class LauncherWheelTest {
 
     private val app get() = ApplicationProvider.getApplicationContext<Application>()
     private val looper get() = shadowOf(Looper.getMainLooper())
-    private lateinit var launcherCode: LauncherCode
+    private lateinit var launcherCode: ApkCode
     private lateinit var server: FakeNavidrome
     private lateinit var car: CarAudio
     private lateinit var s: MediaService
     /** What the launcher sent the app's session, in order. */
-    private val sent = Collections.synchronizedList(mutableListOf<String>())
+    private val sent get() = ourSession.sent
+    /** The app's session as the launcher holds it (an Android MediaController). */
+    private lateinit var ourSession: SessionBridge
+    /** Android passing the speakers between apps. */
+    private lateinit var focus: AudioFocusStack
+    /** SmartTube's code, if it was converted for this run (SMARTTUBE_APK). */
+    private var smartTubeCode: ApkCode? = null
 
     @Before
     fun setUp() {
-        val jar = LauncherCode.jar
-        assumeTrue("the launcher's code wasn't converted for this run (FIRMWARE_LAUNCHER_APK)", jar != null)
+        val launcher = ApkCode.launcher(javaClass.classLoader!!)
+        assumeTrue("the launcher's code wasn't converted for this run (FIRMWARE_LAUNCHER_APK)", launcher != null)
         if (System.getenv("LAUNCHER_LOG") != null) org.robolectric.shadows.ShadowLog.stream = System.out
-        launcherCode = LauncherCode(jar!!, javaClass.classLoader!!)
+        launcherCode = launcher!!
         freshCache()
+        focus = AudioFocusStack(app)
+        smartTubeCode = ApkCode.smartTube(javaClass.classLoader!!)
         server = FakeNavidrome()
         // As if played before: Navidrome's transcoding cache has them, so they can be skipped through.
         server.transcodeCached = true
@@ -125,7 +127,7 @@ class LauncherWheelTest {
      * A change is written where the car keeps it (android.car.VOLUME_GROUP/n),
      * which is what the app watches.
      */
-    private class CarAudio(private val app: Context, code: LauncherCode) {
+    private class CarAudio(private val app: Context, code: ApkCode) {
         private val audioStub = code.loadClass("com.saicmotor.carapi.audio.ICarAudioService\$Stub")
         private val adapterStub = code.loadClass("com.saicmotor.carapi.ICarAdapterService\$Stub")
         private val audioDescriptor = constant(audioStub, "DESCRIPTOR") as String
@@ -186,61 +188,6 @@ class LauncherWheelTest {
     }
 
     /**
-     * The app's session as the launcher holds it (an Android MediaController).
-     * Its commands go to the app's session callback, on the app's main thread,
-     * the way Android delivers them; its state is the one the app last set.
-     */
-    private fun launcherView(s: MediaService): MediaController {
-        val session = field(s, "session") as MediaSessionCompat
-        val impl = field(session, "mImpl")!!
-        val callback = impl.javaClass.getMethod("getCallback").invoke(impl) as MediaSessionCompat.Callback
-        // The callback Android calls (MediaSessionCompat's, which passes it on to the app's).
-        val android = field(callback, "mCallbackFwk") as MediaSession.Callback
-        val main = Handler(Looper.getMainLooper())
-        val iface = Class.forName("android.media.session.ISessionController")
-        val binder = Binder()
-        val controller = Proxy.newProxyInstance(iface.classLoader, arrayOf(iface)) { proxy, m, args ->
-            fun deliver(what: String, call: () -> Unit): Any? { sent += what; main.post(call); return null }
-            when (m.name) {
-                "play"             -> deliver("play") { android.onPlay() }
-                "pause"            -> deliver("pause") { android.onPause() }
-                "next"             -> deliver("next") { android.onSkipToNext() }
-                "previous"         -> deliver("previous") { android.onSkipToPrevious() }
-                "fastForward"      -> deliver("fastForward") { android.onFastForward() }
-                "rewind"           -> deliver("rewind") { android.onRewind() }
-                "sendCustomAction" -> (args!![2] as String).let { action ->
-                    deliver(action) { android.onCustomAction(action, args[3] as Bundle?) } }
-                "getPackageName"   -> "com.saicmotor.media"
-                "getTag"           -> "MediaService"
-                "asBinder"         -> binder
-                "hashCode"         -> System.identityHashCode(proxy)
-                "equals"           -> proxy === args?.get(0)
-                "toString"         -> "the app's session"
-                else               -> throw AssertionError("the launcher asked the session for ${m.name}: not stood in for")
-            }
-        }
-        val token = MediaSession.Token::class.java.getDeclaredConstructor(iface).apply { isAccessible = true }.newInstance(controller)
-        val view = MediaController(app, token)
-        // Robolectric's MediaController keeps a state of its own: it's given the
-        // app's each time the app sets one (as Android passes it on).
-        val shadow = shadowOf(view)
-        fun show(state: PlaybackStateCompat?) = shadow.setPlaybackState(state?.playbackState as PlaybackState?)
-        show(field(impl, "mPlaybackState") as PlaybackStateCompat?)
-        val listener = Proxy.newProxyInstance(javaClass.classLoader, arrayOf(IMediaControllerCallback::class.java)) { proxy, m, args ->
-            when (m.name) {
-                "onPlaybackStateChanged" -> { show(args!![0] as PlaybackStateCompat?); null }
-                "asBinder" -> binder
-                "hashCode" -> System.identityHashCode(proxy)
-                "equals"   -> proxy === args?.get(0)
-                "toString" -> "the launcher's view"
-                else       -> null
-            }
-        } as IMediaControllerCallback
-        (field(impl, "mExtraSession") as IMediaSession).registerCallbackListener(listener)
-        return view
-    }
-
-    /**
      * The launcher's steering-wheel code, set up as it is in the car once it's
      * running: the screen on, not reversing, the app's session the current
      * source, the wheel keys set to control media (not custom functions).
@@ -248,7 +195,7 @@ class LauncherWheelTest {
     private fun startLauncher(s: MediaService) {
         val code = launcherCode
         val mm = code.bare("com.saicmotor.launcher.model.ModeManager")
-        val set = { name: String, value: Any? -> LauncherCode.set(mm, name, value) }
+        val set = { name: String, value: Any? -> ApkCode.set(mm, name, value) }
         set("mSystemPowerState", true)
         set("mScreenStateMachine", code.bare("com.saicmotor.launcher.model.ScreenStateMachine"))
         val callbackIface = code.loadClass("com.saicmotor.launcher.ILauncherCallback")
@@ -260,7 +207,8 @@ class LauncherWheelTest {
                 else       -> defaultFor(m.returnType)
             }
         })
-        set("mCurrentController", launcherView(s))
+        ourSession = SessionBridge(app, field(s, "session")!!, "com.saicmotor.media")
+        set("mCurrentController", ourSession.controller)
         val workHandler = code.loadClass("com.saicmotor.launcher.model.ModeManager\$WorkHandler")
             .getDeclaredConstructor(mm.javaClass, Looper::class.java).apply { isAccessible = true }
         set("mHandler", workHandler.newInstance(mm, Looper.getMainLooper()))
@@ -284,7 +232,7 @@ class LauncherWheelTest {
 
     // ── the app ──────────────────────────────────────────────────────────
 
-    private fun field(target: Any, name: String): Any? = LauncherCode.get(target, name)
+    private fun field(target: Any, name: String): Any? = ApkCode.get(target, name)
 
     private fun MediaService.player(): ExoPlayer = field(this, "player") as ExoPlayer
 
@@ -324,6 +272,8 @@ class LauncherWheelTest {
         val start = SystemClock.uptimeMillis()
         while (SystemClock.uptimeMillis() - start < ms && !until()) {
             looper.idleFor(Duration.ofMillis(10))
+            focus.check()
+            SessionBridge.syncAll()
             Thread.sleep(1)
         }
     }
@@ -331,7 +281,7 @@ class LauncherWheelTest {
     /** Waits (in real time) for work done off the main thread, e.g. the app turning the volume. */
     private fun waitFor(done: () -> Boolean) {
         val until = System.currentTimeMillis() + 5_000
-        while (!done() && System.currentTimeMillis() < until) { looper.idle(); Thread.sleep(5) }
+        while (!done() && System.currentTimeMillis() < until) { looper.idle(); focus.check(); Thread.sleep(5) }
         looper.idle()
     }
 
@@ -593,6 +543,202 @@ class LauncherWheelTest {
         s.otherPlayerForTest = null
         press(CENTRE); drive(600)
         assertTrue(playing)
+    }
+
+    // ── the launcher's now-playing tile ──────────────────────────────────
+
+    /** What the launcher's tile model passed on to the tile to show: metadata and states, in order. */
+    private val tileGot = Collections.synchronizedList(mutableListOf<Any?>())
+    private val tileStates get() = tileGot.filterIsInstance<PlaybackState>()
+    private val tileSong get() = tileGot.filterIsInstance<MediaMetadata>().lastOrNull()
+
+    /**
+     * The launcher's now-playing tile: its model (MediaModel), given the app's
+     * session as the launcher does once the music's the source.  What it
+     * passes on is what the tile shows; its buttons are the tile's.
+     */
+    private fun tile(): Any {
+        val model = launcherCode.bare("com.saicmotor.launcher.model.MediaModel")
+        ApkCode.set(model, "mMediaControllerCallback", launcherCode.loadClass("com.saicmotor.launcher.model.MediaModel\$1")
+            .getDeclaredConstructor(model.javaClass).apply { isAccessible = true }.newInstance(model))
+        val listener = launcherCode.loadClass("com.saicmotor.launcher.model.IBaseModel\$IBaseEventListener")
+        ApkCode.set(model, "mMediaListener", Proxy.newProxyInstance(launcherCode, arrayOf(listener)) { proxy, m, args ->
+            when (m.name) {
+                "onSuccess", "onChanged" -> { tileGot += args!![0]; null }
+                "hashCode" -> System.identityHashCode(proxy)
+                "equals"   -> proxy === args?.get(0)
+                "toString" -> "the tile"
+                else       -> null
+            }
+        })
+        model.javaClass.getDeclaredMethod("setController", MediaController::class.java).apply { isAccessible = true }
+            .invoke(model, ourSession.controller)
+        return model
+    }
+
+    /** A tap on one of the tile's buttons: "playPause", "next", "prev". */
+    private fun Any.tap(button: String) {
+        if (button == "playPause") javaClass.getMethod(button, java.lang.Boolean.TYPE).invoke(this, true)
+        else javaClass.getMethod(button).invoke(this)
+        looper.idle()
+    }
+
+    @Test
+    fun tileShowsTheSongPlaying() {
+        carOn()
+        tile(); drive(500)
+        val song = server.songs.values.first()
+        assertEquals(song.title, tileSong?.getString(MediaMetadata.METADATA_KEY_TITLE))
+        assertEquals("Artist", tileSong?.getString(MediaMetadata.METADATA_KEY_ARTIST))
+        assertEquals("no art address (the tile would fetch it itself, slowly)",
+            null, tileSong?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI))
+        assertEquals(song.seconds * 1_000L, tileSong?.getLong(MediaMetadata.METADATA_KEY_DURATION))
+        assertEquals("shown as playing", PlaybackState.STATE_PLAYING, tileStates.last().state)
+        val model = tile()
+        model.tap("next"); drive(600)
+        assertEquals(1, index)
+        assertEquals(server.songs.values.toList()[1].title, tileSong?.getString(MediaMetadata.METADATA_KEY_TITLE))
+        model.tap("prev"); drive(600)
+        assertTrue(playing)
+    }
+
+    /** A song that's slow to come: the tile shows it playing (anything else shows as paused), not paused. */
+    @Test
+    fun tileShowsPlayingWhileASongLoads() {
+        server.plan = { song, _ -> if (song == 2) FakeNavidrome.Reply.StallAfter(0, 1_500) else FakeNavidrome.Reply.Whole }
+        carOn()
+        val model = tile()
+        model.tap("next"); drive(200)
+        model.tap("next"); drive(300)
+        tileGot.clear()
+        drive(60_000) { s.player().isPlaying && index == 2 }
+        assertEquals(2, index)
+        assertTrue("it plays once it's come", s.player().isPlaying)
+        assertTrue("states shown while it came: ${tileStates.map { it.state }}",
+            tileStates.isNotEmpty() && tileStates.all { it.state == PlaybackState.STATE_PLAYING })
+    }
+
+    /** Quick taps on the tile's play/pause button: each counts. */
+    @Test
+    fun tileQuickTapsEachCount() {
+        carOn()
+        val model = tile()
+        model.tap("playPause"); drive(1_500)
+        assertFalse("paused", playing)
+        sent.clear()
+        model.tap("playPause"); drive(150); model.tap("playPause"); drive(1_000)
+        println("tile sent: $sent")
+        assertFalse("played then paused", playing)
+    }
+
+    // ── with SmartTube (the YouTube app used in the car) ──────────────────
+
+    private fun smartTube(): SmartTube {
+        val code = smartTubeCode
+        assumeTrue("SmartTube's code wasn't converted for this run (SMARTTUBE_APK)", code != null)
+        return SmartTube(app, code!!)
+    }
+
+    private fun videoUrl() = com.saicmotor.media.subsonic.SubsonicClient.streamUrl(
+        SubsonicSettings.load(app)!!, server.songs.values.last().id)
+
+    /** The music playing, then a video opened in SmartTube: it takes the speakers and the music pauses. */
+    private fun watchingAVideo(): SmartTube {
+        val tube = smartTube()
+        carOn()
+        tube.open(videoUrl())
+        drive(5_000) { tube.state == 3 && !playing }
+        assertTrue("the video's playing", tube.playWhenReady && tube.state == 3)
+        assertFalse("the music paused for it", playing)
+        drive(1_500)
+        sent.clear()
+        return tube
+    }
+
+    @Test
+    fun smartTubeCentreKeyPausesAndPlaysTheVideo() {
+        val tube = watchingAVideo()
+        press(CENTRE); drive(600)
+        assertEquals("the launcher sends the music 'play' (it's paused)", listOf("play"), sent.toList())
+        assertEquals(listOf("pause"), tube.bridge!!.sent.toList())
+        assertFalse("the video paused", tube.playWhenReady)
+        press(CENTRE); drive(600)
+        assertEquals(listOf("pause", "play"), tube.bridge!!.sent.toList())
+        assertTrue("the video's playing again", tube.playWhenReady)
+        assertFalse("the music stays paused", playing)
+    }
+
+    @Test
+    fun smartTubeQuickPressesEachCount() {
+        val tube = watchingAVideo()
+        press(CENTRE); drive(100); press(CENTRE); drive(600)
+        assertEquals(listOf("pause", "play"), tube.bridge!!.sent.toList())
+        assertTrue(tube.playWhenReady)
+        press(CENTRE); drive(100); press(CENTRE); drive(100); press(CENTRE); drive(600)
+        assertFalse("paused, played, paused", tube.playWhenReady)
+        assertFalse(playing)
+    }
+
+    /** Volume, next and previous leave the video (and the music) alone. */
+    @Test
+    fun smartTubeOtherKeysLeaveTheVideoAlone() {
+        val tube = watchingAVideo()
+        press(VOLUME_UP); drive(600)
+        press(NEXT); drive(600)
+        press(PREVIOUS); drive(600)
+        assertEquals("nothing sent to the video", emptyList<String>(), tube.bridge!!.sent.toList())
+        assertTrue(tube.playWhenReady)
+        assertFalse(playing)
+        assertEquals("the music's queue where it was", 0, index)
+        assertEquals(listOf("launcher up"), car.steps.toList())
+    }
+
+    /** Paused on the screen, the video still gets the centre key (it took the speakers). */
+    @Test
+    fun smartTubePausedOnScreenStillGetsTheCentreKey() {
+        val tube = watchingAVideo()
+        tube.bridge!!.controller.transportControls.pause()   // as its own pause button does
+        drive(600)
+        assertFalse(tube.playWhenReady)
+        tube.bridge!!.sent.clear()
+        press(CENTRE); drive(600)
+        assertEquals(listOf("play"), tube.bridge!!.sent.toList())
+        assertTrue("the video plays", tube.playWhenReady)
+        assertFalse("not the music", playing)
+    }
+
+    /** After Back (STAR) the launcher drops the next key: the app does it, for the video. */
+    @Test
+    fun smartTubeCentreKeyAfterStar() {
+        val tube = watchingAVideo()
+        star(); press(CENTRE); drive(800)
+        assertEquals("the launcher sent nothing", emptyList<String>(), sent.toList())
+        assertEquals(listOf("pause"), tube.bridge!!.sent.toList())
+        assertFalse("the video paused", tube.playWhenReady)
+        assertFalse(playing)
+    }
+
+    /** Back closes the video; the centre key is the music's again (the launcher drops it after STAR: the app does it). */
+    @Test
+    fun smartTubeClosedWithBackThenCentrePlaysTheMusic() {
+        val tube = watchingAVideo()
+        star(); tube.close(); drive(300)
+        press(CENTRE); drive(800)
+        assertTrue("the music plays", playing)
+        drive(2_000)
+        // And the next press (the launcher's) pauses it.
+        press(CENTRE); drive(600)
+        assertFalse(playing)
+    }
+
+    /** Closed without Back (e.g. the home button): the launcher's "play" plays the music. */
+    @Test
+    fun smartTubeClosedThenCentrePlaysTheMusic() {
+        val tube = watchingAVideo()
+        tube.close(); drive(1_000)
+        press(CENTRE); drive(600)
+        assertEquals(listOf("play"), sent.toList())
+        assertTrue("the music plays", playing)
     }
 
     private companion object {

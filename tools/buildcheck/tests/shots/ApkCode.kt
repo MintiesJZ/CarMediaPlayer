@@ -7,15 +7,17 @@ import java.io.File
 import java.net.URLClassLoader
 
 /**
- * The SAIC launcher's own code, converted from the head unit's firmware (see
- * tools/firmware/README.md; it's SAIC's, so it's never in the repo).  SAIC's
- * classes come from the converted jar; everything else (Android, the app,
- * libraries) from the test, so the launcher talks to the app's real service.
+ * Another app's own code, converted from its APK with dex2jar for this run
+ * (see tools/firmware/README.md; it's never in the repo): the SAIC launcher
+ * ([launcher]) or SmartTube ([smartTube]).  The classes it [owns] come from
+ * the converted jar — its own copies, as in its own process; Android's and
+ * everything else from the test, so it talks to the app's real service.
  */
-class LauncherCode(jar: File, parent: ClassLoader) : URLClassLoader(arrayOf(jar.toURI().toURL()), parent) {
+class ApkCode private constructor(jar: File, parent: ClassLoader, private val owns: ApkCode.(String) -> Boolean) :
+    URLClassLoader(arrayOf(jar.toURI().toURL()), parent) {
 
     override fun loadClass(name: String, resolve: Boolean): Class<*> = synchronized(this) {
-        if (SAIC.none { name.startsWith(it) }) return super.loadClass(name, resolve)
+        if (!owns(name)) return super.loadClass(name, resolve)
         val c = findLoadedClass(name) ?: findClass(name)
         if (resolve) resolveClass(c)
         c
@@ -36,7 +38,7 @@ class LauncherCode(jar: File, parent: ClassLoader) : URLClassLoader(arrayOf(jar.
         return defineClass(name, fixed, 0, fixed.size)
     }
 
-    /** SAIC's own additions to Android that the launcher names (stood in for, empty, as they're never used here). */
+    /** Android classes it names that aren't in Android 9 (SAIC's own additions): stood in for, empty, as they're never used here. */
     val standIns = mutableListOf<String>()
 
     private fun standIn(name: String): ByteArray? {
@@ -49,12 +51,15 @@ class LauncherCode(jar: File, parent: ClassLoader) : URLClassLoader(arrayOf(jar.
         return w.toByteArray()
     }
 
+    /** From the jar only: the app has classes of the same name (CommandParcelable, the media library). */
     private fun classBytes(internalName: String): ByteArray? =
-        getResourceAsStream("$internalName.class")?.use { it.readBytes() }
+        findResource("$internalName.class")?.openStream()?.use { it.readBytes() }
+
+    private fun inJar(name: String) = findResource(name.replace('.', '/') + ".class") != null
 
     /** A class's superclass and whether it's an interface, without loading it (it may be the one being made). */
     private fun describe(internalName: String): Pair<String?, Boolean> {
-        if (SAIC.any { internalName.replace('/', '.').startsWith(it) }) {
+        if (owns(internalName.replace('/', '.'))) {
             val r = ClassReader(classBytes(internalName) ?: return "java/lang/Object" to false)
             return r.superName to (r.access and Opcodes.ACC_INTERFACE != 0)
         }
@@ -80,10 +85,25 @@ class LauncherCode(jar: File, parent: ClassLoader) : URLClassLoader(arrayOf(jar.
 
     companion object {
         /** The launcher's own packages and the car library it carries. */
-        private val SAIC = listOf("com.saicmotor.launcher.", "com.saicmotor.carapi.", "com.saicmotor.adapterservice.", "com.saicmotor.ev.")
+        private val SAIC = listOf("com.saicmotor.launcher.", "com.saicmotor.carapi.", "com.saicmotor.adapterservice.", "com.saicmotor.ev.",
+            // SAIC's own CommandParcelable etc., not the app's copy: commands cross between the two as parcels.
+            "com.saicmotor.common.")
 
-        /** Where the converted launcher is, if it was made for this run (FIRMWARE_LAUNCHER_APK). */
-        val jar: File? get() = System.getProperty("launcher.jar")?.let(::File)?.takeIf { it.isFile }
+        /** Android's own classes, shared by every app (android.support is a library, not Android). */
+        private fun android(name: String) =
+            (name.startsWith("android.") && !name.startsWith("android.support.")) ||
+                listOf("java.", "javax.", "jdk.", "sun.", "kotlin.", "dalvik.", "com.android.", "org.json.", "org.w3c.",
+                    "org.xml.", "org.xmlpull.", "org.apache.http.").any { name.startsWith(it) }
+
+        private fun jar(property: String): File? = System.getProperty(property)?.let(::File)?.takeIf { it.isFile }
+
+        /** The SAIC launcher, if it was converted for this run (FIRMWARE_LAUNCHER_APK). */
+        fun launcher(parent: ClassLoader): ApkCode? =
+            jar("launcher.jar")?.let { ApkCode(it, parent) { name -> SAIC.any { name.startsWith(it) } } }
+
+        /** SmartTube, if it was converted for this run (SMARTTUBE_APK): every class it carries is its own copy. */
+        fun smartTube(parent: ClassLoader): ApkCode? =
+            jar("smarttube.jar")?.let { ApkCode(it, parent) { name -> !android(name) && inJar(name) } }
 
         private val UNSAFE = Class.forName("sun.misc.Unsafe").getDeclaredField("theUnsafe").apply { isAccessible = true }.get(null)
         private val UNSAFE_ALLOCATE = UNSAFE.javaClass.getMethod("allocateInstance", Class::class.java)
