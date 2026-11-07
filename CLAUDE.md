@@ -50,7 +50,7 @@ release (the alpha versions before it, 2.0–2.0.14, aren't kept).
 
 `tools/buildcheck` builds the app's sources with the same dependencies as
 `app/build.gradle` and runs the Robolectric tests in `tools/buildcheck/tests`
-(33 service tests, 10 streaming tests, 21 screenshot tests →
+(33 service tests, 13 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
 `tools/buildcheck/app/build/shots`, 7 against a real Navidrome, skipped
 unless one is running: `tools/navidrome/README.md`, and 33 with the car's own
 launcher — 7 of them with SmartTube too — skipped unless their APKs are
@@ -83,7 +83,9 @@ which calls a method Android 9 doesn't have and stops playback.  Media3 caches
 the decoder list, so it's cleared per test.  Positions follow real time while
 the looper follows the test's clock, so check packets heard, not positions.
 The test clock also runs faster than the server, so a song change can catch
-the look-ahead mid-download where in the car it wouldn't.
+the look-ahead mid-download where in the car it wouldn't (the player then
+follows that download, as on a weak signal), and a download paced to be slow
+must still outrun the music on that clock.
 
 `RealNavidromeTest` does the same against a real Navidrome 0.64.2 built from
 source (`tools/navidrome`), through a `Relay` that can break, slow or cut off
@@ -221,6 +223,17 @@ are the main thread here.
   512 KB fragments so a power cut loses little).
 - A continuous downloader fetches the next 10 songs while playing
   (`startDownloader`), pausing while the current song has < 10 s buffered.
+- A song that comes up while the look-ahead is still downloading it (a skip,
+  or a weak signal) is taken from that download as it comes in
+  (`MediaCache.Follow`, `LiveDownload`): the cache can't be read past what's
+  saved until the download's done, and the player used to fetch the song a
+  second time alongside — twice the data on the same signal (a cut-out at
+  the song change) and a piece of the song never kept.  The download carries
+  on once its song is playing; if it stops, the player fetches the rest
+  itself at once (`DownloadStopped`).  Only the part that may not be saved
+  yet is held in memory (the 512 KB piece being written and the one before);
+  the player reads anything earlier from the cache.  The look-ahead leaves a
+  song the player's already fetching itself (`playerIsFetching`).
 - `WaitForNetworkPolicy` retries through dead spots instead of failing.
 - A song that's still streaming (transcoded: no length, and the Ogg reader
   can't tell its duration) would count as live radio, so a dropped

@@ -1754,8 +1754,13 @@ class MediaService : MediaBrowserServiceCompat() {
      *    gets the connection first (one already going carries on: carrying on
      *    later would fetch its first part again, as Navidrome starts a
      *    transcoded song over for every request).
-     *  - A download stops if its song is no longer coming up (you jumped
-     *    elsewhere) or is now the one playing (the player takes over).
+     *  - A download stops if its song is no longer coming up or playing (you
+     *    jumped elsewhere).  A song that comes up while it's still
+     *    downloading (a skip, or a weak signal) carries on downloading: the
+     *    player takes it from the download as it comes in (see MediaCache),
+     *    rather than fetching it a second time alongside.
+     *  - A song the player's already fetching itself (the next one, once the
+     *    one playing is all in) is left to the player.
      *  - If the network drops, it tries again a few seconds later.
      */
     private fun startDownloader() {
@@ -1766,7 +1771,8 @@ class MediaService : MediaBrowserServiceCompat() {
                 // A song the player has already streamed into the cache (see
                 // KeepWhatPlays) is found there: not downloaded again.
                 val target = upcomingItems(PRECACHE_SONGS).firstOrNull {
-                    it.mediaId !in precached && (downloadFailures[it.mediaId] ?: 0) < MAX_DOWNLOAD_FAILURES
+                    it.mediaId !in precached && (downloadFailures[it.mediaId] ?: 0) < MAX_DOWNLOAD_FAILURES &&
+                        !MediaCache.playerIsFetching(it.mediaId)
                 } ?: continue
                 val uri = target.localConfiguration?.uri ?: continue
                 val id  = target.mediaId
@@ -1774,8 +1780,8 @@ class MediaService : MediaBrowserServiceCompat() {
                 var stopped = false
                 while (download.isActive) {
                     delay(500)
-                    if (!stopped && (player.currentMediaItem?.mediaId == id ||
-                                     upcomingItems(PRECACHE_SONGS).none { it.mediaId == id })) {
+                    if (!stopped && player.currentMediaItem?.mediaId != id &&
+                                     upcomingItems(PRECACHE_SONGS).none { it.mediaId == id }) {
                         stopped = true
                         precacheWriter?.cancel()
                     }
@@ -1787,7 +1793,7 @@ class MediaService : MediaBrowserServiceCompat() {
                         downloadFailures.remove(id)
                         Log.i(TAG, "Downloaded ahead: ${target.mediaMetadata.title}")
                     }
-                    stopped -> Log.i(TAG, "Stopped downloading ahead: ${target.mediaMetadata.title} (skipped to, or no longer coming up)")
+                    stopped -> Log.i(TAG, "Stopped downloading ahead: ${target.mediaMetadata.title} (no longer coming up)")
                     generateSequence<Throwable>(error) { it.cause }.take(8).any { it is SongRefused && it.notFound } -> {
                         downloadFailures[id] = MAX_DOWNLOAD_FAILURES   // not asked for again
                         Log.i(TAG, "Not downloading ahead: ${target.mediaMetadata.title} (the server has no such song)")

@@ -42,6 +42,11 @@ class WaitForNetworkPolicy : DefaultLoadErrorHandlingPolicy() {
             // The server says the song doesn't exist (the app skips it), or
             // refused the login (the app shows that and waits): see MediaService.
             e is SongRefused && (e.notFound || e.loginRefused) -> C.TIME_UNSET
+            // The player can't take the next part from the look-ahead's
+            // download (it stopped, or that part's on disk by now): it reads
+            // on from the cache or the server, straight away.
+            generateSequence<Throwable>(e) { it.cause }.take(8).any { it is DownloadStopped } ->
+                if (info.errorCount > MAX_WAIT_RETRIES) C.TIME_UNSET else 0L
             httpCode != null && httpCode >= 500 ->
                 if (info.errorCount > MAX_WAIT_RETRIES) C.TIME_UNSET else SERVER_RETRY_MS
             // Navidrome is running as many transcodes as it's set to allow:

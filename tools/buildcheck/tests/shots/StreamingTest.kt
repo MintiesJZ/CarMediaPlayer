@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Looper
 import android.os.SystemClock
 import androidx.media3.datasource.DataSpec
+import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -190,23 +191,21 @@ class StreamingTest {
 
     /**
      * Every song is kept as it plays, whether the look-ahead downloaded it or
-     * the player streamed it, and none is downloaded twice (bar a piece where
-     * the two overlap).  (The player's
+     * the player streamed it, and none is downloaded twice.  (The player's
      * songs weren't kept — ExoPlayer doesn't keep a stream of unknown length
-     * — so the look-ahead then downloaded each next song a second time.)
+     * — so the look-ahead then downloaded each next song a second time.  And
+     * where the two overlapped, both fetched the song and a piece went
+     * unkept.)
      */
     @Test
     fun everySongIsKeptAndNoneDownloadedTwice() {
         server.addSongs(3, seconds = 10)
         val s = startPlaying()
         drive(s, 60_000, until = { heardAll(2) })
-        assertKeptWhole(0)
         for (song in 0..2) {
             assertHeardWhole(song)
-            assertKeptIsTheSong(song)
-            val size = server.songs.values.elementAt(song).opus.size
-            val sent = streamRequests(song).sumOf { it.sent.get() }
-            assertTrue("song $song: $sent bytes sent for $size", sent < size * 3 / 2)
+            assertKeptWhole(song)
+            assertEquals("song $song fetched once: ${streamRequests(song).map { it.range }}", 1, streamRequests(song).size)
         }
         s.onDestroy()
     }
@@ -224,9 +223,89 @@ class StreamingTest {
         drive(s, 60_000, until = { heardAll(1) })
         assertHeardWhole(0)
         assertHeardWhole(1)
+        // Part-way, not from the start: how far depends on how much the player
+        // had read when the connection was reset (what hadn't been is lost).
         val again = streamRequests(0)[1]
-        assertTrue("asked to carry on from part-way: ${again.range}", again.range!!.removePrefix("bytes=").substringBefore('-').toInt() > 50_000)
+        assertTrue("asked to carry on from part-way: ${again.range}", again.range!!.removePrefix("bytes=").substringBefore('-').toInt() in 1..100_000)
         assertKeptWhole(0)
+        s.onDestroy()
+    }
+
+    /**
+     * The next song comes up (a skip, or a slow signal) while the look-ahead
+     * is still downloading it: the player takes it from that download, so
+     * it's fetched once and kept whole.  (The player used to fetch it again
+     * alongside; a piece read while the look-ahead still held it went unkept,
+     * and on a slow signal the two shared the connection.)
+     */
+    @Test
+    fun aSongStillDownloadingWhenSkippedToIsFetchedOnceAndKeptWhole() {
+        // A long first song: the player doesn't get on to the next one itself
+        // for a while (it loads up to 120 s ahead).  The next is long enough
+        // that the download doesn't hold all of it (what's on disk is read
+        // from there).
+        server.addSongs(1, seconds = 300)
+        server.addSongs(1, seconds = 100)
+        server.addSongs(1, seconds = 20)
+        // The look-ahead's download of song 1 gets going, then stalls for a moment.
+        server.plan = { song, attempt -> if (song == 1 && attempt == 1) FakeNavidrome.Reply.StallAfter(120_000, 3_000) else FakeNavidrome.Reply.Whole }
+        val s = startPlaying()
+        drive(s, 30_000, until = { streamRequests(1).firstOrNull()?.sent?.get() ?: 0 >= 120_000 })
+        assertEquals("the look-ahead's downloading it", 1, streamRequests(1).size)
+        s.player().seekToNextMediaItem()   // skipped to while it's downloading
+        drive(s, 60_000, until = { heardAll(1) })
+        println("song 1 requests: ${streamRequests(1).map { "${it.range} ${it.sent.get()}" }}")
+        assertHeardWhole(1)
+        assertKeptWhole(1)
+        assertEquals("fetched once", 1, streamRequests(1).size)
+        s.onDestroy()
+    }
+
+    /**
+     * The connection drops while the player's taking the song from the
+     * look-ahead's download: once the server's back, the player fetches the
+     * rest itself, and the song's still heard and kept whole.
+     */
+    @Test
+    fun aDownloadCutOffWhileItsSongPlaysIsCarriedOn() {
+        server.addSongs(1, seconds = 300)
+        server.addSongs(2, seconds = 20)
+        server.plan = { song, attempt -> if (song == 1 && attempt == 1) FakeNavidrome.Reply.StallAfter(120_000, 3_000) else FakeNavidrome.Reply.Whole }
+        val s = startPlaying()
+        drive(s, 30_000, until = { streamRequests(1).firstOrNull()?.sent?.get() ?: 0 >= 120_000 })
+        s.player().seekToNextMediaItem()
+        drive(s, 90_000, until = { heardAll(1) }, during = { t ->
+            if (t in 2_000 until 2_020) server.goDown()      // a dead spot, as the download stalls
+            if (t in 12_000 until 12_020) server.comeBack()
+        })
+        println("song 1 requests: ${streamRequests(1).map { "${it.range} ${it.sent.get()}" }}")
+        assertHeardWhole(1)
+        assertKeptWhole(1)
+        val again = streamRequests(1).last()
+        assertTrue("carried on from part-way: ${again.range}", (again.range?.removePrefix("bytes=")?.substringBefore('-')?.toInt() ?: 0) >= 100_000)
+        s.onDestroy()
+    }
+
+    /**
+     * A weak signal (about twice what the music needs): the songs play
+     * through their changes without stopping to load.
+     */
+    @Test
+    fun aWeakSignalPlaysThroughSongChanges() {
+        server.addSongs(4, seconds = 20)
+        server.bytesPerSecond = 200_000
+        val s = startPlaying()
+        var started = false
+        val stalls = ArrayList<String>()
+        drive(s, 240_000, until = { heardAll(3) }, during = { t ->
+            val p = s.player()
+            if (p.isPlaying) started = true
+            if (started && p.playWhenReady && p.playbackState == Player.STATE_BUFFERING)
+                stalls += "$t ms: song ${p.currentMediaItemIndex} at ${p.currentPosition} ms"
+        })
+        println("stalls (${stalls.size} ticks): ${stalls.take(20)}")
+        for (song in 0..3) assertHeardWhole(song)
+        assertTrue("stopped to load ${stalls.size * 20} ms: ${stalls.take(5)}", stalls.size * 20 <= 200)
         s.onDestroy()
     }
 

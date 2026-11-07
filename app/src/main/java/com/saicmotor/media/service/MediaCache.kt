@@ -5,11 +5,15 @@ import android.net.Uri
 import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.common.C
+import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.TransferListener
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.cache.CacheDataSink
 import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.ContentMetadata
 import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
@@ -17,6 +21,8 @@ import com.saicmotor.media.data.Storage
 import com.saicmotor.media.data.SubsonicSettings
 import com.saicmotor.media.subsonic.SubsonicClient
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * A disk cache of songs, shared by the player and the pre-cacher.
@@ -63,14 +69,32 @@ object MediaCache {
             }.also { cache = it }
         }
 
-    /** Where the player reads songs from: the cache, falling back to the server. */
+    /**
+     * Where the player reads songs from: the cache, falling back to the
+     * server — or, for a song the look-ahead is still downloading, to that
+     * download as it comes in (see [Follow]).
+     */
     fun dataSourceFactory(context: Context): CacheDataSource.Factory {
+        val server = serverFactory(context)
         val cache = cache(context)
-        val app = context.applicationContext
+        return cacheFactory(context) {
+            Follow(server.createDataSource()) { key -> ContentMetadata.getContentLength(cache.getContentMetadata(key)) }
+        }
+    }
+
+    private fun cacheFactory(context: Context, upstream: DataSource.Factory): CacheDataSource.Factory {
+        val cache = cache(context)
         return CacheDataSource.Factory()
             .setCache(cache)
             .setCacheWriteDataSinkFactory(CacheDataSink.Factory().setCache(cache).setFragmentSize(PIECE_BYTES))
-            .setUpstreamDataSourceFactory(ResolvingDataSource.Factory(
+            .setUpstreamDataSourceFactory(upstream)
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+    }
+
+    /** The songs from the server. */
+    private fun serverFactory(context: Context): DataSource.Factory {
+        val app = context.applicationContext
+        return ResolvingDataSource.Factory(
                 // An error message in place of the song is never saved as the song (see SongReplies).
                 SongReplies.Factory(
                     // No User-Agent of our own: Navidrome treats each client name +
@@ -86,8 +110,7 @@ object MediaCache {
                         .setConnectTimeoutMs(6_000)
                         .setReadTimeoutMs(15_000)
                 )
-            ) { dataSpec -> dataSpec.withUri(withCurrentLogin(app, dataSpec.uri)) })
-            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+            ) { dataSpec -> dataSpec.withUri(withCurrentLogin(app, dataSpec.uri)) }
     }
 
     /**
@@ -108,7 +131,7 @@ object MediaCache {
     fun cachedFraction(context: Context, mediaId: String): Float? {
         val c = cache(context)
         val key = keyFor(mediaId)
-        val length = androidx.media3.datasource.cache.ContentMetadata.getContentLength(c.getContentMetadata(key))
+        val length = ContentMetadata.getContentLength(c.getContentMetadata(key))
         if (length <= 0) return null
         return c.getCachedBytes(key, 0, length).toFloat() / length
     }
@@ -121,18 +144,153 @@ object MediaCache {
     fun isCached(context: Context, mediaId: String): Boolean {
         val c = cache(context)
         val key = keyFor(mediaId)
-        val length = androidx.media3.datasource.cache.ContentMetadata.getContentLength(c.getContentMetadata(key))
+        val length = ContentMetadata.getContentLength(c.getContentMetadata(key))
         return length > 0 && c.isCached(key, 0, length)
     }
 
     /**
      * Downloads a song into the cache.  Blocking: run it off the main thread.
      * Returns a [CacheWriter] handle via [onStart] so it can be cancelled.
+     * While it runs, the player can take the song from it (see [Follow]).
      */
     fun precache(context: Context, mediaId: String, uri: Uri, onStart: (CacheWriter) -> Unit) {
-        val dataSpec = DataSpec.Builder().setUri(uri).setKey(keyFor(mediaId)).build()
-        val writer = CacheWriter(dataSourceFactory(context).createDataSource(), dataSpec, null, null)
-        onStart(writer)
-        writer.cache()
+        val key = keyFor(mediaId)
+        val download = LiveDownload(PIECE_BYTES)
+        val server = serverFactory(context)
+        val source = cacheFactory(context) { Recording(server.createDataSource(), download) }.createDataSource()
+        val writer = CacheWriter(source, DataSpec.Builder().setUri(uri).setKey(key).build(), null, null)
+        live[key] = download
+        var complete = false
+        try {
+            onStart(writer)
+            writer.cache()
+            complete = true
+        } finally {
+            live.remove(key, download)
+            download.stopped(complete)
+        }
+    }
+
+    // ── The player and the look-ahead on the same song ────────────────────
+
+    /** Songs the look-ahead is downloading, by cache key. */
+    private val live = ConcurrentHashMap<String, LiveDownload>()
+    /** Songs the player is fetching from the server itself, by cache key (how many connections). */
+    private val playerFetching = ConcurrentHashMap<String, AtomicInteger>()
+
+    /**
+     * True while the player is fetching the song from the server itself
+     * (the next song, once the one playing is all in): the look-ahead leaves
+     * it, as the cache keeps what the player fetches.  Fetching it as well
+     * downloaded it twice, sharing a weak signal, and kept nothing of it.
+     */
+    fun playerIsFetching(mediaId: String): Boolean = (playerFetching[keyFor(mediaId)]?.get() ?: 0) > 0
+
+    /**
+     * The player's way to the server.  For a song the look-ahead is still
+     * downloading (skipped to, or come up on a weak signal), the cache can't
+     * be read past what's on disk until that download's done, and the player
+     * used to fetch the song again alongside it: twice the data on the same
+     * signal (the song stopped to load), and what it read while the download
+     * held the song wasn't kept (a piece missing for next time).  It takes
+     * the song from the download as it comes in instead.
+     *
+     * The player doesn't learn the song's length when the download that
+     * finished it was someone else's, so at the end of what's on disk it
+     * asks for more: past the end of a song whose length is known by then,
+     * that's answered here (nothing more), not by the server (which
+     * transcodes the whole song again to send nothing).
+     */
+    private class Follow(private val server: DataSource, private val knownLength: (String) -> Long) : DataSource {
+        private var download: LiveDownload? = null
+        private var pastEnd = false
+        private var key: String? = null
+        private var spec: DataSpec? = null
+        private var position = 0L
+        private var remaining = C.LENGTH_UNSET.toLong()
+
+        override fun addTransferListener(transferListener: TransferListener) = server.addTransferListener(transferListener)
+
+        override fun open(dataSpec: DataSpec): Long {
+            val length = dataSpec.key?.let(knownLength) ?: C.LENGTH_UNSET.toLong()
+            if (length != C.LENGTH_UNSET.toLong() && dataSpec.position >= length) {
+                pastEnd = true
+                spec = dataSpec
+                return 0
+            }
+            val d = dataSpec.key?.let { live[it] }
+            if (d != null && d.covers(dataSpec.position)) {
+                download = d
+                spec = dataSpec
+                position = dataSpec.position
+                remaining = dataSpec.length
+                return C.LENGTH_UNSET.toLong()
+            }
+            download = null
+            key = dataSpec.key?.also { playerFetching.getOrPut(it) { AtomicInteger() }.incrementAndGet() }
+            try {
+                return server.open(dataSpec)
+            } catch (e: Exception) {
+                done()
+                throw e
+            }
+        }
+
+        private fun done() {
+            key?.let { k -> playerFetching[k]?.let { if (it.decrementAndGet() <= 0) playerFetching.remove(k, it) } }
+            key = null
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            if (pastEnd) return if (length == 0) 0 else C.RESULT_END_OF_INPUT
+            val d = download ?: return server.read(buffer, offset, length)
+            if (length == 0) return 0
+            if (remaining == 0L) return C.RESULT_END_OF_INPUT
+            val want = if (remaining == C.LENGTH_UNSET.toLong()) length else minOf(length.toLong(), remaining).toInt()
+            val n = d.read(position, buffer, offset, want)
+            if (n == C.RESULT_END_OF_INPUT) return n
+            position += n
+            if (remaining != C.LENGTH_UNSET.toLong()) remaining -= n
+            return n
+        }
+
+        override fun getUri(): Uri? = if (download != null || pastEnd) spec?.uri else server.uri
+
+        override fun getResponseHeaders(): Map<String, List<String>> =
+            if (download != null || pastEnd) emptyMap() else server.responseHeaders
+
+        override fun close() {
+            if (pastEnd) { pastEnd = false; return }
+            if (download != null) { download = null; return }
+            done()
+            server.close()
+        }
+    }
+
+    /** The look-ahead's way to the server: what comes in is also handed to [download], for [Follow]. */
+    private class Recording(private val server: DataSource, private val download: LiveDownload) : DataSource {
+        private var position = 0L
+
+        override fun addTransferListener(transferListener: TransferListener) = server.addTransferListener(transferListener)
+
+        override fun open(dataSpec: DataSpec): Long {
+            download.starting(dataSpec.position)
+            val length = server.open(dataSpec)
+            position = dataSpec.position
+            return length
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            val n = server.read(buffer, offset, length)
+            if (n > 0) {
+                download.received(position, buffer, offset, n)
+                position += n
+            }
+            return n
+        }
+
+        override fun getUri(): Uri? = server.uri
+        override fun getResponseHeaders(): Map<String, List<String>> = server.responseHeaders
+        override fun close() = server.close()
     }
 }

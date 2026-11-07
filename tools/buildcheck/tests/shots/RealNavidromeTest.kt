@@ -216,36 +216,13 @@ class RealNavidromeTest {
     private fun assertKeptWhole(song: SubsonicSong) {
         val server = fromServer(song)
         val kept = kept(song)
-        assertEquals("${song.title}: kept whole", server.size, kept.size)
-        assertArrayEquals("${song.title}: kept as the server sends it", normalised(server), normalised(kept))
-        assertEquals(1.0f, MediaCache.cachedFraction(app, "sub:${song.id}"))
-    }
-
-    /**
-     * What's kept of [song] is the song as the server sends it, as far as it
-     * goes from the start (bar the serial number and checksums, which differ
-     * between transcodes; where they are is taken from the server's copy, as
-     * what's kept may stop part-way through a page).
-     */
-    private fun assertKeptIsTheSong(song: SubsonicSong) {
-        val server = fromServer(song)
-        val kept = kept(song)
         System.getenv("NAVIDROME_DUMP")?.let { dir ->
             java.io.File(dir, "${song.id}.server.opus").writeBytes(server)
             java.io.File(dir, "${song.id}.kept.opus").writeBytes(kept)
         }
-        assertTrue("${song.title}: ${kept.size} bytes kept of ${server.size}", kept.size <= server.size)
-        val skip = HashSet<Int>()
-        var i = 0
-        while (i + 27 <= server.size) {
-            for (k in 14..17) skip += i + k
-            for (k in 22..25) skip += i + k
-            val segments = server[i + 26].toInt() and 0xFF
-            i += 27 + segments + (0 until segments).sumOf { server[i + 27 + it].toInt() and 0xFF }
-        }
-        for (k in kept.indices) if (k !in skip && kept[k] != server[k]) {
-            throw AssertionError("${song.title}: what's kept differs from the server's at byte $k of ${kept.size}")
-        }
+        assertEquals("${song.title}: kept whole", server.size, kept.size)
+        assertArrayEquals("${song.title}: kept as the server sends it", normalised(server), normalised(kept))
+        assertEquals(1.0f, MediaCache.cachedFraction(app, "sub:${song.id}"))
     }
 
     private fun report(title: String) {
@@ -297,23 +274,23 @@ class RealNavidromeTest {
         playThrough(s, songs)
         report("album")
         songs.forEach { assertHeardWhole(it) }
-        assertKeptWhole(songs[0])
-        // The next song may be the look-ahead's and the player's at once
-        // here (the test's clock runs fast): a piece of it can go unkept.
-        assertKeptIsTheSong(songs[1])
+        songs.forEach { assertKeptWhole(it) }
+        songs.forEach { assertEquals("${it.title} fetched once", 1, relay.streams(it.id).size) }
         s.onDestroy()
     }
 
     /**
      * The next song comes up while the look-ahead is still downloading it (a
-     * skip, or a slow signal): the player and the look-ahead both fetch it.
-     * What's kept of it must still be the song.
+     * skip, or a slow signal): the player takes it from that download, so
+     * it's fetched once, heard whole and kept whole.
      */
     @Test
-    fun aSongStillDownloadingWhenItComesUpIsKeptRight() {
+    fun aSongStillDownloadingWhenSkippedToIsFetchedOnceAndKeptWhole() {
         val songs = album("Glass Orchard").drop(2).take(2)
-        // The look-ahead's download of the next song goes slowly.
-        relay.pace = { e, attempt -> if (e.endpoint == "stream" && e.param("id") == songs[1].id && attempt == 1) 60_000 else null }
+        // The look-ahead's download of the next song goes slowly: a few
+        // seconds for the song, still faster than it plays on the test's
+        // clock (which runs about ten times as fast as the server).
+        relay.pace = { e, attempt -> if (e.endpoint == "stream" && e.param("id") == songs[1].id && attempt == 1) 250_000 else null }
         val s = play(songs)
         drive(s, 60_000) { relay.streams(songs[1].id).isNotEmpty() }
         drive(s, 1_000)
@@ -321,7 +298,8 @@ class RealNavidromeTest {
         playThrough(s, songs)
         report("skipped to a song still downloading")
         assertHeardWhole(songs[1])
-        assertKeptIsTheSong(songs[1])
+        assertKeptWhole(songs[1])
+        assertEquals("fetched once", 1, relay.streams(songs[1].id).size)
         s.onDestroy()
     }
 
