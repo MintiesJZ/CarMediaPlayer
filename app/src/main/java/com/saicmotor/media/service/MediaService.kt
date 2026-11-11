@@ -53,6 +53,7 @@ import com.saicmotor.common.CommandParcelable
 import com.saicmotor.media.R
 import com.saicmotor.media.data.PlaybackSettings
 import com.saicmotor.media.data.SubsonicSettings
+import com.saicmotor.media.mbs.BrowseAccess
 import com.saicmotor.media.subsonic.SubsonicAlbum
 import com.saicmotor.media.subsonic.SubsonicClient
 import com.saicmotor.media.subsonic.SubsonicException
@@ -158,7 +159,6 @@ class MediaService : MediaBrowserServiceCompat() {
 
         // Keys in each browse item's extras (used to build the player item)
         private const val X_DURATION  = "duration"
-        private const val X_STREAM    = "stream_uri"
         private const val X_TITLE     = "title"
         private const val X_ARTIST    = "artist"
         private const val X_ALBUM     = "album"
@@ -2067,10 +2067,12 @@ class MediaService : MediaBrowserServiceCompat() {
     }
 
     /** The playable children of a browse node, ready for ExoPlayer. */
-    private suspend fun playableChildren(parentId: String): List<MediaItem> =
-        loadChildren(parentId)
+    private suspend fun playableChildren(parentId: String): List<MediaItem> {
+        val cfg = subsonicCfg() ?: return emptyList()
+        return loadChildren(parentId)
             .filter { it.isPlayable && it.mediaId != SHUFFLE_ALL_ID }
-            .mapNotNull { child -> child.mediaId?.let { resolveMediaItem(it, child.description.extras) } }
+            .mapNotNull { child -> child.mediaId?.let { resolveMediaItem(it, child.description.extras, cfg) } }
+    }
 
     /**
      * Replaces the queue and starts playing.  Every way of starting playback
@@ -2228,7 +2230,7 @@ class MediaService : MediaBrowserServiceCompat() {
             val songs = try { SubsonicClient.getRandomSongs(cfg, LIBRARY_BATCH) } catch (_: SubsonicException) { emptyList() }
             songItems(cfg, songs)
                 .filter { it.mediaId !in exclude }
-                .mapNotNull { child -> child.mediaId?.let { resolveMediaItem(it, child.description.extras) } }
+                .mapNotNull { child -> child.mediaId?.let { resolveMediaItem(it, child.description.extras, cfg) } }
         }
 
     /** Keeps a library shuffle going by appending another random batch. */
@@ -2587,7 +2589,7 @@ class MediaService : MediaBrowserServiceCompat() {
         val cfg = subsonicCfg() ?: return@withContext null
         val song = try { SubsonicClient.getSong(cfg, mediaId.removePrefix(SUBSONIC_SONG_PREFIX)) }
                    catch (_: SubsonicException) { return@withContext null }
-        songItems(cfg, listOf(song)).firstOrNull()?.let { resolveMediaItem(mediaId, it.description.extras) }
+        songItems(cfg, listOf(song)).firstOrNull()?.let { resolveMediaItem(mediaId, it.description.extras, cfg) }
     }
 
     /** Rebuilds a playable item from what [ResumeStore] saved. */
@@ -2602,16 +2604,24 @@ class MediaService : MediaBrowserServiceCompat() {
             saved.albumId?.let { putString(X_ALBUM_ID, it) }
             saved.artistId?.let { putString(X_ARTIST_ID, it) }
             putLong(X_DURATION, saved.durationMs)
-            // A fresh login token: the saved one may be out of date.
-            putString(X_STREAM, SubsonicClient.streamUrl(cfg, id.removePrefix(SUBSONIC_SONG_PREFIX)))
         }
-        return resolveMediaItem(id, extras)
+        return resolveMediaItem(id, extras, cfg)
     }
 
-    /** Builds a playable [MediaItem] from a mediaId + the extras bundle we stashed at browse time. */
-    private fun resolveMediaItem(mediaId: String, extras: Bundle?): MediaItem? {
+    /**
+     * Builds a playable [MediaItem] from a mediaId + the extras bundle we
+     * stashed at browse time (null without them: a song handed back with no
+     * details, as the launcher does, is looked up instead).
+     *
+     * Where the song is streamed from is worked out here, from the server
+     * and login in Settings: it isn't among what's handed out when browsing
+     * (it carries the login).
+     */
+    private fun resolveMediaItem(mediaId: String, extras: Bundle?, config: SubsonicSettings.Config? = null): MediaItem? {
         if (!mediaId.startsWith(SUBSONIC_SONG_PREFIX)) return null
-        val streamUri = extras?.getString(X_STREAM)?.let { Uri.parse(it) } ?: return null
+        if (extras?.getString(X_TITLE) == null) return null
+        val cfg = config ?: subsonicCfg() ?: return null
+        val streamUri = Uri.parse(SubsonicClient.streamUrl(cfg, mediaId.removePrefix(SUBSONIC_SONG_PREFIX)))
         val meta = androidx.media3.common.MediaMetadata.Builder()
             .setTitle(extras.getString(X_TITLE))
             .setArtist(extras.getString(X_ARTIST))
@@ -2633,7 +2643,11 @@ class MediaService : MediaBrowserServiceCompat() {
 
     // ── MediaBrowserServiceCompat — browsing contract ──────────────────────
 
-    override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot {
+    override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot? {
+        if (!BrowseAccess.allowed(clientUid)) {
+            Log.w(TAG, "Browse connection refused: $clientPackageName (uid $clientUid) isn't one of the car's own apps")
+            return null
+        }
         Log.i(TAG, "Browse connection from $clientPackageName (uid $clientUid)")
         return BrowserRoot(ROOT_ID, null)
     }
@@ -2730,7 +2744,6 @@ class MediaService : MediaBrowserServiceCompat() {
             val artUrl = song.coverArt?.let { SubsonicClient.coverArtUrl(cfg, it, NOW_PLAYING_ART_PX) }
             val extras = Bundle().apply {
                 putLong(X_DURATION,    song.durationMs)
-                putString(X_STREAM,    SubsonicClient.streamUrl(cfg, song.id))
                 putString(X_TITLE,     song.title)
                 putString(X_ARTIST,    song.artist ?: "")
                 putString(X_ALBUM,     song.album  ?: "")

@@ -19,6 +19,12 @@ key) and plays **only from a Navidrome server**.
   in a commit that's ready to go out.  The GitHub release is the delivery:
   don't send the APK separately, just say the version is on its way and
   check that the workflow published it.
+- *Check for updates* finds the latest version from where github.com sends
+  `…/releases/latest` on to (`…/releases/tag/v<versionName>`) and fetches
+  the APK by its name from `…/releases/download/<tag>/`: **the tag and the
+  APK's name must stay as they are**.  (Not GitHub's API: it answers only
+  60 times an hour for everyone behind one address, which a phone network
+  shares between many customers.)
 - Bump `versionCode` (+1) and `versionName` in **both** `app/build.gradle` and
   `tools/buildcheck/app/build.gradle`.  versionName goes 1.0 → 1.0.1 → 1.1 …
   and must keep rising (Check for updates compares names).  versionCode
@@ -41,7 +47,7 @@ key) and plays **only from a Navidrome server**.
 
 `tools/buildcheck` builds the app's sources with the same dependencies as
 `app/build.gradle` and runs the Robolectric tests in `tools/buildcheck/tests`
-(39 service tests, 24 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
+(42 service tests, 24 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
 `tools/buildcheck/app/build/shots`, 7 against a real Navidrome, skipped
 unless one is running: `tools/navidrome/README.md`, and 33 with the car's own
 launcher — 7 of them with SmartTube too — skipped unless their APKs are
@@ -184,6 +190,14 @@ are the main thread here.
   with play wanted is shown as playing and pause pauses it.  The session is
   told when play / pause changes while loading too
   (`onPlayWhenReadyChanged`).
+- **Who may browse** (`mbs/BrowseAccess`): MediaService and the launcher's
+  four browse services answer only the car's own apps — callers running as
+  the system user, as the launcher (`com.saicmotor.launcher`), the system's
+  screens (`com.android.systemui`), `com.saicmotor.eol` and this app all
+  do.  What's handed out carries the Navidrome login (the cover addresses
+  hold the username and a token), so any other app is refused, and the log
+  says which.  Songs handed out don't say where they're streamed from: the
+  player works that out itself (`resolveMediaItem`).
 - **Updating itself**: as a platform-signed system-UID app it holds
   INSTALL_PACKAGES, so `Updater` installs through a PackageInstaller session
   with no prompt (if the installer asks for confirmation anyway, its screen

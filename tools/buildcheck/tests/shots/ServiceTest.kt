@@ -379,18 +379,67 @@ class ServiceTest {
         assertFalse(s.player().playWhenReady)
     }
 
+    /**
+     * A stand-in for GitHub's site: asked for [path] it sends the caller on
+     * to [sendsOnTo] (or answers 404 if that's null).  Returns its address.
+     */
+    private fun gitHubSendingOn(vararg sendsOnTo: Pair<String, String?>): String {
+        val socket = java.net.ServerSocket(0, 10, java.net.InetAddress.getLoopbackAddress())
+        val site = "http://127.0.0.1:${socket.localPort}"
+        kotlin.concurrent.thread(isDaemon = true) {
+            while (true) {
+                val client = try { socket.accept() } catch (_: Exception) { break }
+                client.use {
+                    val path = it.getInputStream().bufferedReader().readLine()?.split(' ')?.getOrNull(1)
+                    val to = sendsOnTo.firstOrNull { (from, _) -> from == path }?.second
+                    val reply = if (to != null) "HTTP/1.1 302 Found\r\nLocation: $site$to\r\n" else "HTTP/1.1 404 Not Found\r\n"
+                    it.getOutputStream().apply { write("${reply}Content-Length: 0\r\nConnection: close\r\n\r\n".toByteArray()); flush() }
+                }
+            }
+        }
+        return site
+    }
+
+    /**
+     * The latest version is found from where GitHub's site sends "the latest
+     * release" on to — not from GitHub's API, which only answers 60 times an
+     * hour for everyone sharing an address (as on a phone network).
+     */
+    @Test
+    fun updaterFindsTheLatestReleaseFromWhereGitHubSendsItOn() {
+        val u = com.saicmotor.media.update.Updater
+        val before = u.releases
+        try {
+            val site = gitHubSendingOn(
+                "/Someone/App/releases/latest" to "/Someone/App/releases/tag/v3.4.5",
+                "/Someone/Empty/releases/latest" to "/Someone/Empty/releases",        // nothing released: the list
+                "/Old/Name/releases/latest" to "/Someone/App/releases/latest")        // the repository was renamed
+            u.releases = "$site/Someone/App/releases"
+            val latest = u.fetchLatest()
+            assertEquals("3.4.5", latest.version)
+            assertEquals("$site/Someone/App/releases/download/v3.4.5/CarMediaPlayer-3.4.5-MG4-platform-signed.apk", latest.apkUrl)
+            u.releases = "$site/Old/Name/releases"
+            assertEquals("followed to its new name", "3.4.5", u.fetchLatest().version)
+            u.releases = "$site/Someone/Empty/releases"
+            assertTrue("nothing released", try { u.fetchLatest(); false } catch (_: java.io.FileNotFoundException) { true })
+            u.releases = "$site/No/Such/releases"
+            assertTrue("no such repository", try { u.fetchLatest(); false } catch (_: java.io.FileNotFoundException) { true })
+        } finally {
+            u.releases = before
+        }
+    }
+
     @Test
     fun updaterReadsTheLatestReleaseAndComparesVersions() {
-        val json = """{"tag_name":"v2.0.10","name":"2.0.10","assets":[
-            {"name":"notes.txt","browser_download_url":"https://example.com/notes.txt","size":10},
-            {"name":"CarMediaPlayer-2.0.10-MG4-platform-signed.apk","browser_download_url":"https://example.com/app.apk","size":8059106}]}"""
-        val r = com.saicmotor.media.update.Updater.parseRelease(json)
-        assertEquals("2.0.10", r.version)
-        assertEquals("https://example.com/app.apk", r.apkUrl)
-        assertEquals(8059106L, r.apkSize)
-        assertEquals(null, com.saicmotor.media.update.Updater.parseRelease("""{"tag_name":"2.1","assets":[]}""").apkUrl)
-
+        // GitHub sends "the latest release" on to that release's page: its address says which it is.
         val u = com.saicmotor.media.update.Updater
+        val r = u.latestFrom("https://github.com/${u.REPO}/releases/tag/v2.0.10")!!
+        assertEquals("2.0.10", r.version)
+        assertEquals("https://github.com/${u.REPO}/releases/download/v2.0.10/CarMediaPlayer-2.0.10-MG4-platform-signed.apk", r.apkUrl)
+        assertEquals("2.1", u.latestFrom("https://github.com/${u.REPO}/releases/tag/2.1/")!!.version)
+        assertEquals("nothing published: sent to the list of releases", null, u.latestFrom("https://github.com/${u.REPO}/releases"))
+        assertEquals("not a tag", null, u.latestFrom("https://github.com/${u.REPO}/releases/tag/../../x"))
+
         assertTrue(u.isNewer("2.0.10", "2.0.9"))
         assertTrue(u.isNewer("2.1", "2.0.9"))
         assertTrue(u.isNewer("3.0.0", "2.9.99"))
@@ -1049,5 +1098,52 @@ class ServiceTest {
         val fifth = startedAgain()
         assertTrue("carried on", fifth.player().playWhenReady)
         assertEquals(4, fifth.player().currentMediaItemIndex)
+    }
+
+    // ── Who may browse ───────────────────────────────────────────────────
+
+    /**
+     * Browsing is for the car's own apps — the launcher and the system's
+     * screens, which run as the system user, as this app does: what's
+     * handed out carries the Navidrome login (in the cover addresses).  Any
+     * other app on the head unit is turned away.  (Anyone was let in.)
+     */
+    @Test
+    fun onlyTheCarsOwnAppsMayBrowse() {
+        val s = service()
+        assertNotNull("the launcher", s.onGetRoot("com.saicmotor.launcher", 1000, null))
+        assertNotNull("the same, as the head unit's second user", s.onGetRoot("com.saicmotor.launcher", 1_001_000, null))
+        assertNotNull("this app", s.onGetRoot(app.packageName, android.os.Process.myUid(), null))
+        assertEquals("another app", null, s.onGetRoot("org.example.player", 10_123, null))
+        assertEquals("another app, second user", null, s.onGetRoot("org.example.player", 1_010_123, null))
+
+        // The services the launcher itself connects to.
+        val forLauncher = Robolectric.buildService(com.saicmotor.media.mbs.Usb1MediaBrowserService::class.java).get()
+        assertNotNull("the launcher", forLauncher.onGetRoot("com.saicmotor.launcher", 1000, null))
+        assertNotNull("the system's screens", forLauncher.onGetRoot("com.android.systemui", 1000, null))
+        assertEquals("another app", null, forLauncher.onGetRoot("org.example.player", 10_123, null))
+    }
+
+    /**
+     * The songs handed out when browsing don't say where they're streamed
+     * from (that address carries the login): the player works it out itself.
+     */
+    @Test
+    fun songsHandedOutDontSayWhereTheyreStreamedFrom() {
+        val s = service()
+        val cfg = SubsonicSettings.load(app)
+        val song = com.saicmotor.media.subsonic.SubsonicSong("s1", "Song 1", "Artist", "Album", 200_000L, null, "al1", "ar1")
+        @Suppress("UNCHECKED_CAST")
+        val handedOut = (MediaService::class.java.declaredMethods.first { it.name == "songItems" }.apply { isAccessible = true }
+            .invoke(s, cfg, listOf(song)) as List<android.support.v4.media.MediaBrowserCompat.MediaItem>).single()
+        val extras = handedOut.description.extras!!
+        val said = extras.keySet().map { "$it=${extras.get(it)}" } + listOf("${handedOut.description.mediaUri}", "${handedOut.description.iconUri}")
+        assertTrue("no stream address, user name or token: $said", said.none { "/rest/stream" in it || "u=me" in it || "&t=" in it })
+
+        // …and the player still knows where to get it.
+        val playable = MediaService::class.java.declaredMethods.first { it.name == "resolveMediaItem" && it.parameterCount == 3 }
+            .apply { isAccessible = true }.invoke(s, "sub:s1", extras, null) as androidx.media3.common.MediaItem
+        val from = playable.localConfiguration!!.uri.toString()
+        assertTrue(from, from.startsWith("http://127.0.0.1:9/rest/stream") && "id=s1" in from)
     }
 }

@@ -57,7 +57,12 @@ abstract class LauncherProxyService : MediaBrowserServiceCompat() {
         super.onDestroy()
     }
 
-    override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot {
+    override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot? {
+        if (!BrowseAccess.allowed(clientUid)) {
+            Log.w(TAG, "${javaClass.simpleName}: browse connection refused: $clientPackageName (uid $clientUid) " +
+                       "isn't one of the car's own apps")
+            return null
+        }
         Log.i(TAG, "${javaClass.simpleName}: browse connection from $clientPackageName (uid $clientUid), " +
                    "session ready=${sessionToken != null}")
         return BrowserRoot(MediaService.ONLINE_ROOT, null)

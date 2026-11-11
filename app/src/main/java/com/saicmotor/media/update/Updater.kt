@@ -18,7 +18,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
@@ -40,7 +39,20 @@ object Updater {
 
     /** Where releases are published: a tag "v<versionName>" with the signed APK attached. */
     const val REPO = "MintiesJZ/CarMediaPlayer"
-    private const val LATEST_URL = "https://api.github.com/repos/$REPO/releases/latest"
+
+    /**
+     * The repository's releases.  GitHub sends "…/releases/latest" on to the
+     * latest release's own page, …/releases/tag/v<versionName>: that's how
+     * the latest version is found.  (GitHub's API says more, but only 60
+     * times an hour for everyone behind the same address — which a phone
+     * network shares between many customers, so the check could fail with
+     * the connection fine.)
+     */
+    @VisibleForTesting
+    internal var releases = "https://github.com/$REPO/releases"
+
+    /** The APK attached to release [version], as the Release workflow names it. */
+    private fun apkName(version: String) = "CarMediaPlayer-$version-MG4-platform-signed.apk"
 
     private const val TAG = "CarMedia.Update"
 
@@ -57,7 +69,7 @@ object Updater {
 
     enum class Problem { NETWORK, NO_RELEASE, NO_APK, BAD_FILE, INSTALL }
 
-    data class Release(val version: String, val apkUrl: String?, val apkSize: Long)
+    data class Release(val version: String, val apkUrl: String)
 
     private val _status = MutableStateFlow<Status>(Status.Idle)
     val status: StateFlow<Status> = _status.asStateFlow()
@@ -91,10 +103,11 @@ object Updater {
             _status.value = Status.UpToDate(installed)
             return
         }
-        val url = release.apkUrl ?: return fail(Problem.NO_APK)
-
         val apk = try {
-            download(context, url, release)
+            download(context, release)
+        } catch (e: FileNotFoundException) {
+            Log.w(TAG, "No ${apkName(release.version)} with release ${release.version}")
+            return fail(Problem.NO_APK)
         } catch (e: IOException) {
             Log.w(TAG, "Download failed", e)
             return fail(Problem.NETWORK)
@@ -120,45 +133,53 @@ object Updater {
 
     // ── GitHub ─────────────────────────────────────────────────────────────
 
-    private fun open(url: String): HttpURLConnection =
+    private fun open(url: String, followRedirects: Boolean = true): HttpURLConnection =
         (URL(url).openConnection() as HttpURLConnection).apply {
             connectTimeout = 15_000
             readTimeout    = 30_000
-            instanceFollowRedirects = true   // release files redirect to GitHub's file host
+            instanceFollowRedirects = followRedirects   // release files redirect to GitHub's file host
             setRequestProperty("User-Agent", "CarMediaPlayer-updater")
         }
 
-    private fun fetchLatest(): Release {
-        val conn = open(LATEST_URL)
-        conn.setRequestProperty("Accept", "application/vnd.github+json")
-        try {
-            if (conn.responseCode == 404) throw FileNotFoundException(LATEST_URL)
-            if (conn.responseCode !in 200..299) throw IOException("HTTP ${conn.responseCode}")
-            return parseRelease(conn.inputStream.bufferedReader().use { it.readText() })
-        } finally {
-            conn.disconnect()
-        }
-    }
-
-    /** The latest release from GitHub's JSON: its version (tag without the "v") and the APK attached to it. */
+    /**
+     * Where GitHub sends "the latest release" on to says which it is.
+     * FileNotFoundException if nothing's been released.
+     */
     @VisibleForTesting
-    internal fun parseRelease(json: String): Release {
-        val o = JSONObject(json)
-        val version = o.getString("tag_name").trim().removePrefix("v").removePrefix("V")
-        val assets = o.optJSONArray("assets")
-        var url: String? = null
-        var size = -1L
-        if (assets != null) {
-            for (i in 0 until assets.length()) {
-                val a = assets.getJSONObject(i)
-                if (a.optString("name").endsWith(".apk", ignoreCase = true)) {
-                    url  = a.optString("browser_download_url").takeIf { it.isNotBlank() }
-                    size = a.optLong("size", -1L)
-                    break
-                }
+    internal fun fetchLatest(): Release {
+        val site = URL(releases).let { "${it.protocol}://${it.authority}/" }
+        var url = "$releases/latest"
+        repeat(4) {
+            val conn = open(url, followRedirects = false)
+            try {
+                val code = conn.responseCode
+                if (code == 404) throw FileNotFoundException(url)
+                // Not sent on anywhere: no latest release to go to.
+                if (code in 200..299) throw FileNotFoundException(url)
+                if (code !in 300..399) throw IOException("HTTP $code")
+                val to = conn.getHeaderField("Location") ?: throw IOException("HTTP $code to nowhere")
+                latestFrom(to)?.let { return it }
+                // Sent on, but not to a release (the repository under another name, say): follow.
+                if (!to.startsWith(site) || !to.endsWith("/releases/latest")) throw FileNotFoundException(to)
+                url = to
+            } finally {
+                conn.disconnect()
             }
         }
-        return Release(version, url, size)
+        throw IOException("GitHub keeps sending the request on")
+    }
+
+    /**
+     * The latest release, from the address of its page
+     * (…/releases/tag/v1.2.3): its version (the tag without the "v") and
+     * where its APK is.  Null if the address isn't a release's.
+     */
+    @VisibleForTesting
+    internal fun latestFrom(address: String): Release? {
+        val tag = address.substringAfter("/releases/tag/", "").substringBefore('?').substringBefore('#').trimEnd('/')
+        if (!Regex("[A-Za-z0-9][A-Za-z0-9._-]*").matches(tag)) return null
+        val version = tag.removePrefix("v").removePrefix("V")
+        return Release(version, "$releases/download/$tag/${apkName(version)}")
     }
 
     /** "2.0.10" is newer than "2.0.9" (compared number by number). */
@@ -175,16 +196,17 @@ object Updater {
         return false
     }
 
-    private fun download(context: Context, url: String, release: Release): File {
+    private fun download(context: Context, release: Release): File {
         val dir = File(context.cacheDir, "update")
         dir.deleteRecursively()
         dir.mkdirs()
         val file = File(dir, "CarMediaPlayer-${release.version}.apk")
         _status.value = Status.Downloading(release.version, 0)
-        val conn = open(url)
+        val conn = open(release.apkUrl)
         try {
+            if (conn.responseCode == 404) throw FileNotFoundException(release.apkUrl)   // released without its APK
             if (conn.responseCode !in 200..299) throw IOException("HTTP ${conn.responseCode}")
-            val total = conn.contentLengthLong.takeIf { it > 0 } ?: release.apkSize
+            val total = conn.contentLengthLong
             var done = 0L
             var shown = -1
             conn.inputStream.use { input ->
