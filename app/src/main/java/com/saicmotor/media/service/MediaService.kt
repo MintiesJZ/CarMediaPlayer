@@ -22,6 +22,7 @@ import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
+import android.provider.Settings
 import android.support.v4.media.MediaBrowserCompat
 import android.support.v4.media.MediaDescriptionCompat
 import android.support.v4.media.MediaMetadataCompat
@@ -333,6 +334,11 @@ class MediaService : MediaBrowserServiceCompat() {
 
         /** How far ahead the player reads (see the load control in onCreate). */
         private const val MAX_BUFFER_MS = 10 * 60_000
+
+        /** Started again this soon after it was last seen playing: it stopped unexpectedly (see carryOnAfterCrash). */
+        private const val CARRY_ON_WITHIN_MS = 2 * 60_000L
+        /** Stopping again within this long counts as "again". */
+        private const val CARRY_ON_AGAIN_MS  = 10 * 60_000L
     }
 
     private lateinit var player: ExoPlayer
@@ -802,13 +808,96 @@ class MediaService : MediaBrowserServiceCompat() {
         startTicker()
         startDownloader()
 
-        // The launcher starts this service as the head unit comes up.  Put the
-        // last queue back straight away (paused, loading) so the song is ready
-        // the moment the launcher asks for music, ~10 s later.
+        // Started again by Android after stopping unexpectedly while the
+        // music was playing: carry on.  Otherwise the launcher starts this
+        // service as the head unit comes up: put the last queue back straight
+        // away (paused, loading) so the song is ready the moment the launcher
+        // asks for music, ~10 s later.
+        if (carryOnAfterCrash()) return
         if (SystemClock.elapsedRealtime() < STARTUP_WINDOW_MS) {
             startTrace(0L)
             prepareForStartup()
         }
+    }
+
+    // ── Carrying on after stopping unexpectedly ────────────────────────────
+
+    /** Which run of the head unit this is (Android counts its boots). */
+    private fun bootCount(): Int =
+        try { Settings.Global.getInt(contentResolver, Settings.Global.BOOT_COUNT, 0) } catch (_: Exception) { 0 }
+
+    private val appVersion: Long by lazy {
+        try {
+            val info = packageManager.getPackageInfo(packageName, 0)
+            @Suppress("DEPRECATION")
+            if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
+        } catch (_: Exception) { 0L }
+    }
+
+    /** Playing, or meant to be: loading and waiting for the network count; paused, stopped or finished don't. */
+    private fun meantToBePlaying(): Boolean =
+        player.playWhenReady && mediaFocusRequest != null && when (player.playbackState) {
+            Player.STATE_ENDED -> false
+            Player.STATE_IDLE  -> player.playerError != null
+            else               -> true
+        }
+
+    /** What [notePlaying] last wrote down. */
+    private var notedPlaying: Boolean? = null
+
+    /**
+     * Keeps the note that the music is playing ([ResumeStore.Playing]) as
+     * things are: written when that changes, and kept fresh from the ticker
+     * ([refresh]) while it's playing.
+     */
+    private fun notePlaying(refresh: Boolean = false) {
+        val playing = meantToBePlaying()
+        if (playing == notedPlaying && !(playing && refresh)) return
+        notedPlaying = playing
+        resumeStore.savePlaying(
+            if (playing) ResumeStore.Playing(SystemClock.elapsedRealtime(), bootCount(), appVersion) else null)
+    }
+
+    /**
+     * The app stopped unexpectedly while the music was playing (a crash, or
+     * Android short of memory) and has been started again: carry on where it
+     * was.  (It used to come back silent, until play was pressed.)
+     *
+     * It's told from the car starting — where what plays is the start-up
+     * setting's and the launcher's business — by the note [notePlaying]
+     * keeps: playing, moments ago, in this same run of the head unit (same
+     * boot count, and its uptime hasn't gone back) and this version of the
+     * app (after an update, the updater carries on: BootReceiver).  A stop
+     * that's meant (onDestroy) takes the note away.
+     *
+     * If it stops again soon after, the song may be why: the second time the
+     * next song is played instead, and after that it's left paused.
+     */
+    private fun carryOnAfterCrash(): Boolean {
+        val note = resumeStore.loadPlaying() ?: return false
+        resumeStore.savePlaying(null)
+        val now = SystemClock.elapsedRealtime()
+        if (note.boot != bootCount() || note.version != appVersion) return false
+        if (now < note.aliveAt || now - note.aliveAt > CARRY_ON_WITHIN_MS) return false
+        val saved = resumeStore.load() ?: return false
+        val times = resumeStore.countCarryOn(now, note.boot, CARRY_ON_AGAIN_MS)
+        startupHandled = true   // not a start-up: nothing waits for the launcher
+        if (times > 2) {
+            Log.w(TAG, "Stopped unexpectedly $times times running: back, but leaving the music paused")
+            launchRestore(PlaybackSettings.StartupMode.RESUME, saved, play = false)
+            return true
+        }
+        Log.w(TAG, "Stopped unexpectedly while playing: carrying on" + if (times == 2) " with the next song (twice now)" else "")
+        serviceScope.launch {
+            var from = saved
+            if (times == 2) {
+                val queue = withContext(Dispatchers.IO) { resumeStore.loadSnapshot() }
+                val next  = queue.getOrNull(queue.indexOfFirst { it.mediaId == saved.item?.mediaId } + 1)
+                if (next != null) from = saved.copy(item = next, positionMs = 0L)
+            }
+            launchRestore(PlaybackSettings.StartupMode.RESUME, from, play = true)
+        }
+        return true
     }
 
     /**
@@ -857,6 +946,7 @@ class MediaService : MediaBrowserServiceCompat() {
     }
 
     override fun onDestroy() {
+        resumeStore.savePlaying(null)   // stopped on purpose: nothing to carry on from
         stopFastSeek()
         stopDownloader()
         keyRouter.stop()
@@ -886,6 +976,7 @@ class MediaService : MediaBrowserServiceCompat() {
                 val playing = player.isPlaying
                 if (playing) resumeStore.savePosition(player.currentPosition)
                 if (playing) maybeReportPlay()
+                notePlaying(refresh = true)
                 // Plays that couldn't be reported (no signal): try again every half minute.
                 if (++ticks % 6 == 0 && pendingScrobbles.all().isNotEmpty()) {
                     launch(Dispatchers.IO) { sendPendingScrobbles() }
@@ -920,6 +1011,7 @@ class MediaService : MediaBrowserServiceCompat() {
             session.setPlaybackState(buildPlaybackState())
             refreshNotification()
             pushWidgets()
+            notePlaying()
             if (playbackState == Player.STATE_ENDED) onQueueEnded()
         }
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
@@ -929,6 +1021,7 @@ class MediaService : MediaBrowserServiceCompat() {
             session.setPlaybackState(buildPlaybackState())
             refreshNotification()
             pushWidgets()
+            notePlaying()
         }
         override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
             // Use the item passed directly: player.mediaMetadata may not have

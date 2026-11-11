@@ -41,7 +41,7 @@ key) and plays **only from a Navidrome server**.
 
 `tools/buildcheck` builds the app's sources with the same dependencies as
 `app/build.gradle` and runs the Robolectric tests in `tools/buildcheck/tests`
-(33 service tests, 24 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
+(39 service tests, 24 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
 `tools/buildcheck/app/build/shots`, 7 against a real Navidrome, skipped
 unless one is running: `tools/navidrome/README.md`, and 33 with the car's own
 launcher — 7 of them with SmartTube too — skipped unless their APKs are
@@ -276,6 +276,19 @@ are the main thread here.
   has been in touch this start-up (it asks what the app can play as it
   starts): then it's bringing back another source, e.g. the radio left
   paused at switch-off, and the app leaves it.
+- **Stopping unexpectedly** (a crash, or Android short of memory) while
+  the music plays: Android starts the service again (START_STICKY, and the
+  launcher's connection), and it carries on where it was
+  (`carryOnAfterCrash`) instead of coming back silent.  It's told from the
+  car starting — the launcher's and the start-up setting's business — by a
+  note kept fresh every 5 s while the music's meant to be playing
+  (`notePlaying`, `ResumeStore.Playing`): playing, under two minutes ago, in
+  the same run of the head unit (Android's boot count, and the uptime
+  hasn't gone back) and the same version of the app (after an update the
+  updater carries on).  Pausing, another app taking the speakers and
+  `onDestroy` take the note away.  Stopping again within ten minutes: the
+  second time the next song is played (the song may be why), after that the
+  queue comes back paused.
 - Failed scrobbles are queued and retried (`PendingScrobbles`).  A song
   picked up part-way at start-up, past the point where its play is
   reported (half-way, or four minutes), was reported before the car was

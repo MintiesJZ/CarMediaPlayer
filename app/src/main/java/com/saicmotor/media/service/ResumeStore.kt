@@ -24,6 +24,10 @@ import java.io.File
  *
  * Car shutdown is just power loss, so there is no "on shutdown" hook: the
  * position is written every few seconds while playing.
+ *
+ * So is a note that the music is playing ([Playing]): if the app stops
+ * unexpectedly and Android starts it again, that note is what tells it to
+ * carry on (see MediaService.carryOnAfterCrash).
  */
 class ResumeStore(private val context: Context) {
 
@@ -49,6 +53,13 @@ class ResumeStore(private val context: Context) {
         val item:         SavedItem?,
         val positionMs:   Long
     )
+
+    /**
+     * The music was meant to be playing, as of [aliveAt] (the head unit's
+     * uptime, ms), in run number [boot] of the head unit and version
+     * [version] of the app.
+     */
+    data class Playing(val aliveAt: Long, val boot: Int, val version: Long)
 
     // Device-protected storage, so it can be read the moment the head unit boots (see Storage).
     // Looked up each time: after an update the file can be moved in under us (Storage.migrate).
@@ -85,6 +96,36 @@ class ResumeStore(private val context: Context) {
 
     fun savePosition(positionMs: Long) {
         prefs.edit().putLong(K_POSITION, positionMs).apply()
+    }
+
+    /** The music is meant to be playing ([playing], kept fresh while it is), or isn't (null). */
+    fun savePlaying(playing: Playing?) {
+        val edit = prefs.edit()
+        if (playing == null) edit.remove(K_PLAYING_AT)
+        else edit.putLong(K_PLAYING_AT, playing.aliveAt).putInt(K_PLAYING_BOOT, playing.boot).putLong(K_PLAYING_VERSION, playing.version)
+        edit.apply()
+    }
+
+    fun loadPlaying(): Playing? {
+        if (!prefs.contains(K_PLAYING_AT)) return null
+        return Playing(prefs.getLong(K_PLAYING_AT, 0L), prefs.getInt(K_PLAYING_BOOT, 0), prefs.getLong(K_PLAYING_VERSION, 0L))
+    }
+
+    /**
+     * The app is carrying on after stopping unexpectedly, at [now] (uptime,
+     * ms) in run [boot] of the head unit: how many times that makes within
+     * [within] ms of the first.  Written at once (it may stop again).
+     */
+    fun countCarryOn(now: Long, boot: Int, within: Long): Int {
+        val first = prefs.getLong(K_CARRY_ON_FIRST, -1L)
+        val again = first >= 0 && prefs.getInt(K_CARRY_ON_BOOT, -1) == boot && now >= first && now - first <= within
+        val times = if (again) prefs.getInt(K_CARRY_ON_TIMES, 0) + 1 else 1
+        prefs.edit()
+            .putInt(K_CARRY_ON_TIMES, times)
+            .putLong(K_CARRY_ON_FIRST, if (again) first else now)
+            .putInt(K_CARRY_ON_BOOT, boot)
+            .commit()
+        return times
     }
 
     /**
@@ -153,5 +194,11 @@ class ResumeStore(private val context: Context) {
         private const val K_PARENT        = "parent_id"
         private const val K_ITEM          = "item"
         private const val K_POSITION      = "position_ms"
+        private const val K_PLAYING_AT      = "playing_at"
+        private const val K_PLAYING_BOOT    = "playing_boot"
+        private const val K_PLAYING_VERSION = "playing_version"
+        private const val K_CARRY_ON_TIMES  = "carry_on_times"
+        private const val K_CARRY_ON_FIRST  = "carry_on_first"
+        private const val K_CARRY_ON_BOOT   = "carry_on_boot"
     }
 }

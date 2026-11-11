@@ -927,4 +927,127 @@ class ServiceTest {
         assertNotNull(snapshot.firstOrNull { it.mediaId == "sub:s4" })
         assertEquals(200_000L, snapshot[0].durationMs)
     }
+
+    // ── Carrying on after stopping unexpectedly ──────────────────────────
+
+    /** Playing, some minutes into a drive (well past start-up). */
+    private fun playingMidDrive(): MediaService {
+        savePlayingState()
+        val s = service()
+        s.restoredByLauncher()
+        idle(6 * 60_000)
+        assertTrue(s.player().playWhenReady)
+        assertNotNull("noted as playing", ResumeStore(app).loadPlaying())
+        return s
+    }
+
+    /**
+     * The app stops without warning: gone, with what it had written down
+     * left as it was.  (Stopping it is the only way to end its threads here,
+     * and that takes its note away, as a crash wouldn't: it's put back.)
+     */
+    private fun MediaService.crash() {
+        val store = ResumeStore(app)
+        val note = store.loadPlaying()
+        onDestroy()
+        store.savePlaying(note)
+    }
+
+    /** Android starts the app again a few seconds later; nothing asks it to play. */
+    private fun startedAgain(): MediaService {
+        idle(3_000)
+        val s = service()
+        waitFor { s.player().mediaItemCount > 0 }
+        idle(1_000)
+        return s
+    }
+
+    /** It carries on where it was.  (It came back silent, until play was pressed.) */
+    @Test
+    fun musicCarriesOnAfterTheAppStopsUnexpectedly() {
+        playingMidDrive().crash()
+        val s = startedAgain()
+        assertTrue("playing again", s.player().playWhenReady)
+        assertEquals(3, s.player().currentMediaItemIndex)
+        assertEquals(42_000L, s.player().currentPosition)
+    }
+
+    /** Paused music stays off: there's nothing to carry on. */
+    @Test
+    fun pausedMusicIsntCarriedOnAfterTheAppStops() {
+        val first = playingMidDrive()
+        sessionCallback(first).onPause()
+        idle(500)
+        assertEquals("no longer noted as playing", null, ResumeStore(app).loadPlaying())
+        first.crash()
+        assertFalse(startedAgain().player().playWhenReady)
+    }
+
+    /** Stopped on purpose (not a crash): nothing's carried on. */
+    @Test
+    fun stoppedOnPurposeIsntCarriedOn() {
+        playingMidDrive().onDestroy()
+        assertFalse(startedAgain().player().playWhenReady)
+    }
+
+    /**
+     * The car switched off as the music played, and started again: that's a
+     * start-up, for the launcher and the start-up setting to decide — the
+     * music waits to be asked.
+     */
+    @Test
+    fun theCarStartingAgainIsntTakenForTheAppStopping() {
+        // A new run of the head unit…
+        Settings.Global.putInt(app.contentResolver, Settings.Global.BOOT_COUNT, 7)
+        playingMidDrive().crash()
+        Settings.Global.putInt(app.contentResolver, Settings.Global.BOOT_COUNT, 8)
+        assertFalse("a new run of the head unit", startedAgain().player().playWhenReady)
+        // …whose clock starts again (were its count not kept)…
+        val store = ResumeStore(app)
+        store.savePlaying(ResumeStore.Playing(SystemClock.elapsedRealtime() + 3_600_000, 8, 0))
+        val second = startedAgain()
+        assertFalse("last seen playing later than now", second.player().playWhenReady)
+        second.onDestroy()
+        // …and playing long ago isn't "just now".
+        store.savePlaying(ResumeStore.Playing(SystemClock.elapsedRealtime() - 10 * 60_000, 8, 0))
+        assertFalse("long ago", startedAgain().player().playWhenReady)
+    }
+
+    /** After an update the updater carries on (BootReceiver), not this. */
+    @Test
+    fun anUpdateIsntTakenForTheAppStopping() {
+        playingMidDrive().crash()
+        val store = ResumeStore(app)
+        store.savePlaying(store.loadPlaying()!!.copy(version = 12345))   // noted by another version of the app
+        assertFalse(startedAgain().player().playWhenReady)
+    }
+
+    /**
+     * It stops again soon after carrying on: the song may be why, so the
+     * next one is played; a third time, it's left paused.  After a quiet
+     * while it's carried on as the first time.
+     */
+    @Test
+    fun stoppingAgainMovesOnToTheNextSongThenLeavesItPaused() {
+        playingMidDrive().crash()
+        val second = startedAgain()
+        assertEquals(3, second.player().currentMediaItemIndex)
+        second.crash()
+        val third = startedAgain()
+        assertTrue("playing", third.player().playWhenReady)
+        assertEquals("the next song", 4, third.player().currentMediaItemIndex)
+        assertEquals("from its start", 0L, third.player().currentPosition)
+        third.crash()
+        val fourth = startedAgain()
+        assertFalse("left paused", fourth.player().playWhenReady)
+        assertEquals("with the queue back", 4, fourth.player().currentMediaItemIndex)
+        // Play pressed: fine for a quarter of an hour, then it stops once more.
+        sessionCallback(fourth).onPlay()
+        idle(15 * 60_000)
+        assertTrue(fourth.player().playWhenReady)
+        fourth.crash()
+        val fifth = startedAgain()
+        assertTrue("carried on", fifth.player().playWhenReady)
+        assertEquals(4, fifth.player().currentMediaItemIndex)
+    }
 }
