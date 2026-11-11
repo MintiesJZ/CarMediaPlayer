@@ -305,10 +305,8 @@ class MediaService : MediaBrowserServiceCompat() {
         private const val STREAM_RETRY_MS    = 3_000L
         /** How often to try again after the server refused the login (it may have been fixed in Settings). */
         private const val LOGIN_RETRY_MS     = 15_000L
-        /** No network (tunnel, car park, modem still starting): keep trying this often… */
+        /** No network (tunnel, car park, modem still starting): keep trying this often, rather than skipping songs that can't load either. */
         private const val NETWORK_RETRY_MS   = 4_000L
-        /** …for this long, rather than skipping songs that can't load either. */
-        private const val NETWORK_GIVE_UP_MS = 15 * 60_000L
 
         /** Songs downloaded ahead of the one playing, and covers fetched ahead.
          *  Ten, so a run of skips still lands on songs that are already here
@@ -320,7 +318,7 @@ class MediaService : MediaBrowserServiceCompat() {
         private const val DOWNLOADER_IDLE_MS = 1_000L
         /** Network trouble: wait this long before trying the download again… */
         private const val DOWNLOAD_RETRY_MS  = 3_000L
-        /** …and give up on a song after this many failures (until the app restarts). */
+        /** …and give up on a song the server won't send after this many tries (until something else is played). */
         private const val MAX_DOWNLOAD_FAILURES = 5
         /** The song playing gets the connection until it has this much in hand. */
         private const val CURRENT_BUFFER_FIRST_MS = 10_000L
@@ -332,6 +330,9 @@ class MediaService : MediaBrowserServiceCompat() {
         private const val SCROBBLE_AFTER_MS = 240_000L
 
         private const val TICK_MS = 5_000L
+
+        /** How far ahead the player reads (see the load control in onCreate). */
+        private const val MAX_BUFFER_MS = 10 * 60_000
     }
 
     private lateinit var player: ExoPlayer
@@ -358,7 +359,6 @@ class MediaService : MediaBrowserServiceCompat() {
 
     /** Waiting for the network to come back (shown as "buffering", not an error). */
     private var networkWait = false
-    private var networkWaitSince = 0L
     private var networkWaitJob: Job? = null
 
     // ── Pre-caching ────────────────────────────────────────────────────────
@@ -603,6 +603,9 @@ class MediaService : MediaBrowserServiceCompat() {
     /** True if we paused on a transient focus loss and should resume on AUDIOFOCUS_GAIN. */
     private var pausedByFocusLoss = false
 
+    /** The speakers are away for a moment (a call, a navigation prompt): ours again on AUDIOFOCUS_GAIN. */
+    private var focusAway = false
+
     /** True once another app has taken the speakers from us for good (until we
      *  take them back).  While set, steering-wheel keys go to that app. */
     private var yieldedToOtherApp = false
@@ -611,6 +614,7 @@ class MediaService : MediaBrowserServiceCompat() {
     private val mediaFocusListener = AudioManager.OnAudioFocusChangeListener { change ->
         when (change) {
             AudioManager.AUDIOFOCUS_GAIN -> {
+                focusAway = false
                 if (pausedByFocusLoss) {
                     pausedByFocusLoss = false
                     // Something else started playing while we were paused
@@ -625,7 +629,10 @@ class MediaService : MediaBrowserServiceCompat() {
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
                 // Navigation prompt, phone call: pause and resume afterwards.
-                if (player.isPlaying) {
+                // Meant to be playing, not just playing: a song still
+                // loading used to start over the call once it had loaded.
+                focusAway = true
+                if (player.playWhenReady) {
                     pausedByFocusLoss = true
                     player.pause()
                 }
@@ -636,8 +643,12 @@ class MediaService : MediaBrowserServiceCompat() {
                 // next user-initiated play() re-requests focus instead of
                 // short-circuiting on a stale request.  We never resume on our
                 // own after this.
+                // Paused even if the song was still loading (or waiting for
+                // the network): it used to start once it had loaded, and take
+                // the speakers back from the radio.
                 pausedByFocusLoss = false
-                if (player.isPlaying) player.pause()
+                focusAway = false
+                player.pause()
                 mediaFocusRequest = null
                 yieldedToOtherApp = true
                 yieldedAt = SystemClock.elapsedRealtime()
@@ -672,7 +683,10 @@ class MediaService : MediaBrowserServiceCompat() {
     }
 
     private fun requestMediaFocus(): Boolean {
-        if (mediaFocusRequest != null) return true
+        // Still ours — unless they're away for a moment (a call, a prompt):
+        // then ask again, so play pressed during a call is refused by the
+        // car rather than played over it.
+        if (mediaFocusRequest != null && !focusAway) return true
         val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
             .setAudioAttributes(buildMediaAudioAttributes())
             .setOnAudioFocusChangeListener(mediaFocusListener)
@@ -682,10 +696,13 @@ class MediaService : MediaBrowserServiceCompat() {
         if (granted) {
             mediaFocusRequest = request
             yieldedToOtherApp = false
+            focusAway = false
+            pausedByFocusLoss = false
             claimMediaKeys("audio focus granted")
         } else {
             // e.g. during a phone call.  Don't keep the dead request around,
             // or the next attempt would wrongly short-circuit to "granted".
+            // (One lost for a moment is kept: it gets the speakers back.)
             Log.i(TAG, "Audio focus refused")
         }
         return granted
@@ -716,17 +733,24 @@ class MediaService : MediaBrowserServiceCompat() {
             // WaitForNetworkPolicy), and one still streaming carries on where
             // it was if the connection drops (see SongSourceFactory).
             .setMediaSourceFactory(
-                SongSourceFactory(MediaCache.dataSourceFactory(this)) {
-                    it.mediaMetadata.extras?.getLong(X_DURATION, -1L)
-                }.setLoadErrorHandlingPolicy(WaitForNetworkPolicy())
+                SongSourceFactory(
+                    MediaCache.dataSourceFactory(this),
+                    durationMsOf = { it.mediaMetadata.extras?.getLong(X_DURATION, -1L) },
+                    onCutShort = ::songCutShort
+                ).setLoadErrorHandlingPolicy(WaitForNetworkPolicy())
             )
             .setLoadControl(
                 DefaultLoadControl.Builder()
-                    // Read up to two minutes ahead (the default is 50 s),
-                    // which also puts it in the song cache.  Start / restart
-                    // thresholds are the defaults: lower ones made a weak
-                    // signal stutter (play 3 s, stop 5 s, …).
-                    .setBufferDurationsMs(50_000, 120_000, 2_500, 5_000)
+                    // Read up to ten minutes ahead (the default is 50 s):
+                    // the whole of nearly any song, straight away, which
+                    // also puts it in the song cache.  A song only part
+                    // there can't be skipped through or carried on
+                    // part-way (see SongSourceFactory): at two minutes
+                    // ahead, a song chosen and left in its first minutes
+                    // started over from 0:00 the next time the car started.
+                    // Start / restart thresholds are the defaults: lower
+                    // ones made a weak signal stutter (play 3 s, stop 5 s, …).
+                    .setBufferDurationsMs(50_000, MAX_BUFFER_MS, 2_500, 5_000)
                     .setTargetBufferBytes(32 * 1024 * 1024)
                     .build()
             )
@@ -895,7 +919,16 @@ class MediaService : MediaBrowserServiceCompat() {
             }
             session.setPlaybackState(buildPlaybackState())
             refreshNotification()
+            pushWidgets()
             if (playbackState == Player.STATE_ENDED) onQueueEnded()
+        }
+        override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+            // Paused or un-paused while a song's still loading: it isn't
+            // "playing" either way, but what's shown changes (it used to
+            // stay as "playing" until the song had loaded).
+            session.setPlaybackState(buildPlaybackState())
+            refreshNotification()
+            pushWidgets()
         }
         override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
             // Use the item passed directly: player.mediaMetadata may not have
@@ -988,7 +1021,6 @@ class MediaService : MediaBrowserServiceCompat() {
     private fun startNetworkWait() {
         if (!networkWait) {
             networkWait = true
-            networkWaitSince = SystemClock.elapsedRealtime()
             Log.i(TAG, "No connection to the server — waiting for the network")
         }
         if (networkWaitJob?.isActive == true) return
@@ -997,16 +1029,12 @@ class MediaService : MediaBrowserServiceCompat() {
             while (isActive) {
                 delay(NETWORK_RETRY_MS)
                 if (generation != queueGeneration || player.playerError == null) return@launch
-                if (SystemClock.elapsedRealtime() - networkWaitSince > NETWORK_GIVE_UP_MS) {
-                    Log.w(TAG, "Network still down — giving up")
-                    networkWait = false
-                    session.setPlaybackState(buildPlaybackState())
-                    return@launch
-                }
+                // However long it takes (a long drive with no coverage): it
+                // used to give up after a quarter of an hour, and the music
+                // then stayed off when the signal came back.
                 if (!networkAvailable()) continue
                 Log.i(TAG, "Retrying now the network is back")
-                player.prepare()
-                if (mediaFocusRequest != null) player.play()
+                player.prepare()   // plays on if it was playing; paused stays paused
                 return@launch   // a new error starts a new wait
             }
         }
@@ -1030,7 +1058,11 @@ class MediaService : MediaBrowserServiceCompat() {
         val refused = generateSequence(error.cause) { it.cause }.take(8).filterIsInstance<SongRefused>().firstOrNull()
         if (refused != null) Log.w(TAG, "The server didn't send the song: ${refused.message}")
         val generation = queueGeneration
-        val wanted     = mediaFocusRequest != null
+        // Trying again (prepare) plays on if the music was meant to be
+        // playing, and leaves it paused if the driver paused it or another
+        // app has the speakers.  (It used to start whenever the speakers
+        // were still ours, so music paused by the driver could start by
+        // itself after an error.)
         if (refused?.notFound == true) {
             // It's gone from the library (a queue saved before a rescan): no
             // point waiting.  Skip it, or if it's a later song (being loaded
@@ -1050,7 +1082,6 @@ class MediaService : MediaBrowserServiceCompat() {
                     player.removeMediaItem(missing!!)
                 }
                 player.prepare()
-                if (wanted) player.play()
                 return
             }
         }
@@ -1065,7 +1096,6 @@ class MediaService : MediaBrowserServiceCompat() {
                 delay(LOGIN_RETRY_MS)
                 if (generation != queueGeneration || player.playerError == null) return@launch
                 player.prepare()
-                if (wanted) player.play()
             }
             return
         }
@@ -1082,23 +1112,19 @@ class MediaService : MediaBrowserServiceCompat() {
                 if (generation != queueGeneration || player.playerError == null) return@launch
                 Log.i(TAG, "Retrying stream (attempt $streamRetries)")
                 player.prepare()
-                if (wanted) player.play()
             }
         } else if (player.hasNextMediaItem()) {
             Log.w(TAG, "Giving up on this song; skipping")
             streamRetries = 0
             player.seekToNextMediaItem()
             player.prepare()
-            if (wanted) player.play()
         }
     }
 
     // ── Session state ──────────────────────────────────────────────────────
 
     private fun buildPlaybackState(): PlaybackStateCompat {
-        // Loading (just skipped to, or waiting for the network): on its way, not broken.
-        val loading = player.playbackState == Player.STATE_BUFFERING ||
-                      (networkWait && player.playerError != null)
+        val loading = isLoading()
         val state = when {
             player.playerError != null && !networkWait     -> PlaybackStateCompat.STATE_ERROR
             // Shown as playing, not buffering: the car's home-screen tile shows
@@ -1266,8 +1292,19 @@ class MediaService : MediaBrowserServiceCompat() {
     }
 
     private fun togglePlayPause() {
-        if (player.isPlaying) userPause() else userPlay()
+        if (playingOrLoading()) userPause() else userPlay()
     }
+
+    /** Loading (just skipped to, or waiting for the network): on its way, not broken. */
+    private fun isLoading(): Boolean =
+        player.playbackState == Player.STATE_BUFFERING || (networkWait && player.playerError != null)
+
+    /**
+     * Playing, or about to once it's loaded: what's shown as "playing".
+     * (Pause pressed while a song was still loading used to do nothing: it
+     * wasn't "playing" yet.)
+     */
+    private fun playingOrLoading(): Boolean = player.isPlaying || (player.playWhenReady && isLoading())
 
     private fun skipToNext() {
         stopFastSeek()
@@ -1407,7 +1444,7 @@ class MediaService : MediaBrowserServiceCompat() {
 
         if (event.action != KeyEvent.ACTION_DOWN) return true
         val startsPlayback = code == KeyEvent.KEYCODE_MEDIA_PLAY ||
-            ((code == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE || code == KeyEvent.KEYCODE_HEADSETHOOK) && !player.isPlaying)
+            ((code == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE || code == KeyEvent.KEYCODE_HEADSETHOOK) && !playingOrLoading())
         if (startsPlayback && !weOwnPlayback() && otherAudioActive()) {
             // Something we can't identify is playing (no media session to pass
             // the key to).  Don't start our music over the top of it.
@@ -1660,9 +1697,17 @@ class MediaService : MediaBrowserServiceCompat() {
     /** A new song started: tell Navidrome it's "now playing". */
     private fun startPlayReport(item: MediaItem?) {
         playStartedAt = System.currentTimeMillis()
-        playReported  = false
+        // Picked up part-way (the car starting again), past the point where
+        // a play is reported: it was reported before the car was switched
+        // off.  (It used to be reported again at every start.)
+        val duration = item?.mediaMetadata?.extras?.getLong(X_DURATION, -1L) ?: -1L
+        playReported = duration > 0 && countsAsPlayed(player.currentPosition, duration)
         if (player.isPlaying) sendNowPlaying()
     }
+
+    /** Half the song, or four minutes of it. */
+    private fun countsAsPlayed(positionMs: Long, durationMs: Long): Boolean =
+        positionMs >= durationMs / 2 || positionMs >= SCROBBLE_AFTER_MS
 
     /**
      * Tells Navidrome what's playing — once the song is really playing, so
@@ -1681,8 +1726,7 @@ class MediaService : MediaBrowserServiceCompat() {
     private fun maybeReportPlay() {
         if (playReported) return
         val duration = player.duration.takeIf { it != C.TIME_UNSET && it > 0 } ?: return
-        val position = player.currentPosition
-        if (position < duration / 2 && position < SCROBBLE_AFTER_MS) return
+        if (!countsAsPlayed(player.currentPosition, duration)) return
         playReported = true
         val songId = player.currentMediaItem?.mediaId
             ?.takeIf { it.startsWith(SUBSONIC_SONG_PREFIX) }?.removePrefix(SUBSONIC_SONG_PREFIX) ?: return
@@ -1761,7 +1805,8 @@ class MediaService : MediaBrowserServiceCompat() {
      *    rather than fetching it a second time alongside.
      *  - A song the player's already fetching itself (the next one, once the
      *    one playing is all in) is left to the player.
-     *  - If the network drops, it tries again a few seconds later.
+     *  - If the network drops, it tries again every few seconds until it's
+     *    back.  A song the server refuses is given up on after a few tries.
      */
     private fun startDownloader() {
         downloader = serviceScope.launch {
@@ -1799,7 +1844,14 @@ class MediaService : MediaBrowserServiceCompat() {
                         Log.i(TAG, "Not downloading ahead: ${target.mediaMetadata.title} (the server has no such song)")
                     }
                     else -> {
-                        downloadFailures[id] = (downloadFailures[id] ?: 0) + 1
+                        // No connection, or the server busy or restarting,
+                        // isn't the song's fault: only what the server
+                        // refuses counts against it.  (A dead spot used to
+                        // use up the tries of the very next songs, which were
+                        // then never downloaded ahead.)
+                        if (!WaitForNetworkPolicy.isTemporary(error)) {
+                            downloadFailures[id] = (downloadFailures[id] ?: 0) + 1
+                        }
                         Log.i(TAG, "Couldn't download ahead: ${target.mediaMetadata.title} — trying again shortly")
                         delay(DOWNLOAD_RETRY_MS)   // probably the network: give it a moment
                     }
@@ -1818,6 +1870,18 @@ class MediaService : MediaBrowserServiceCompat() {
         } finally {
             precacheWriter = null
         }
+
+    /**
+     * The server ended a song early without an error (a transcode that
+     * died): what's kept of it isn't the whole song, so it isn't treated as
+     * such — it used to stop short at the same place every time it came up.
+     * Called off the main thread (see SongSourceFactory).
+     */
+    private fun songCutShort(item: MediaItem, endedMs: Long) {
+        Log.w(TAG, "The server ended ${item.mediaMetadata.title} early (at ${endedMs / 1000} s): not keeping that as the whole song")
+        MediaCache.notWhole(this, item.mediaId)
+        serviceScope.launch { precached -= item.mediaId }
+    }
 
     private fun currentFullyBuffered(): Boolean {
         // A transcoded stream doesn't say how long it is until it's all in;
@@ -1934,6 +1998,7 @@ class MediaService : MediaBrowserServiceCompat() {
         queueGeneration++
         queueKind     = kind
         streamRetries = 0
+        downloadFailures.clear()
         endNetworkWait()
         stopFastSeek()
 
@@ -2174,7 +2239,7 @@ class MediaService : MediaBrowserServiceCompat() {
      */
     private fun launcherPause() {
         if (!isStartupRequest()) {
-            if (player.isPlaying) userPause()
+            if (playingOrLoading()) userPause()
             return
         }
         traceLauncherAsked()
@@ -2601,7 +2666,7 @@ class MediaService : MediaBrowserServiceCompat() {
             this,
             title     = meta.title?.toString() ?: "",
             artist    = meta.artist?.toString() ?: "",
-            isPlaying = player.isPlaying
+            isPlaying = playingOrLoading()
         )
     }
 
@@ -2611,7 +2676,7 @@ class MediaService : MediaBrowserServiceCompat() {
 
     private fun buildNotification(): Notification {
         val meta      = player.mediaMetadata
-        val isPlaying = player.isPlaying
+        val isPlaying = playingOrLoading()
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(meta.title?.toString() ?: getString(R.string.app_name))

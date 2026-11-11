@@ -20,6 +20,7 @@ import androidx.media3.extractor.ExtractorOutput
 import androidx.media3.extractor.ExtractorsFactory
 import androidx.media3.extractor.PositionHolder
 import androidx.media3.extractor.SeekMap
+import androidx.media3.extractor.TrackOutput
 
 /**
  * Builds the player's source for each song, telling it how long the song is
@@ -32,12 +33,18 @@ import androidx.media3.extractor.SeekMap
  * from the start and the song restarts from the beginning.  With the
  * duration known (the server says how long every song is), it carries on
  * from where the connection dropped instead.
+ *
+ * Knowing the duration also shows when the server ended a song early
+ * without saying so (a transcode that died): [onCutShort] is told, with
+ * where the song stopped (ms), so that copy isn't kept as the whole song.
+ * Called off the main thread.
  */
 @OptIn(UnstableApi::class)
 internal class SongSourceFactory(
     private val dataSourceFactory: DataSource.Factory,
     /** The song's length in milliseconds, or null if unknown. */
-    private val durationMsOf: (MediaItem) -> Long?
+    private val durationMsOf: (MediaItem) -> Long?,
+    private val onCutShort: (MediaItem, Long) -> Unit = { _, _ -> }
 ) : MediaSource.Factory {
 
     private var drm: DrmSessionManagerProvider = DefaultDrmSessionManagerProvider()
@@ -53,7 +60,8 @@ internal class SongSourceFactory(
 
     override fun createMediaSource(mediaItem: MediaItem): MediaSource {
         val durationUs = durationMsOf(mediaItem)?.takeIf { it > 0 }?.times(1_000) ?: C.TIME_UNSET
-        return ProgressiveMediaSource.Factory(KeepWhatPlays(dataSourceFactory), KnownDurationExtractors(durationUs))
+        val extractors = KnownDurationExtractors(durationUs) { endedUs -> onCutShort(mediaItem, endedUs / 1_000) }
+        return ProgressiveMediaSource.Factory(KeepWhatPlays(dataSourceFactory), extractors)
             .setDrmSessionManagerProvider(drm)
             .setLoadErrorHandlingPolicy(loadErrors)
             .createMediaSource(mediaItem)
@@ -96,7 +104,11 @@ internal class KeepWhatPlays(private val upstream: DataSource.Factory) : DataSou
 
 /** The usual extractors, but a stream whose duration they can't tell gets [durationUs]. */
 @OptIn(UnstableApi::class)
-internal class KnownDurationExtractors(private val durationUs: Long) : ExtractorsFactory {
+internal class KnownDurationExtractors(
+    private val durationUs: Long,
+    /** The stream ended well short of [durationUs]: where (µs). */
+    private val onCutShort: (Long) -> Unit = {}
+) : ExtractorsFactory {
     private val all = DefaultExtractorsFactory()
 
     override fun createExtractors(): Array<Extractor> = wrap(all.createExtractors())
@@ -106,19 +118,34 @@ internal class KnownDurationExtractors(private val durationUs: Long) : Extractor
 
     private fun wrap(extractors: Array<Extractor>): Array<Extractor> =
         if (durationUs == C.TIME_UNSET) extractors
-        else Array(extractors.size) { KnownDurationExtractor(extractors[it], durationUs) }
+        else Array(extractors.size) { KnownDurationExtractor(extractors[it], durationUs, onCutShort) }
 }
 
 @OptIn(UnstableApi::class)
 internal class KnownDurationExtractor(
     private val extractor: Extractor,
-    private val knownDurationUs: Long
+    private val knownDurationUs: Long,
+    private val onCutShort: (Long) -> Unit = {}
 ) : Extractor {
+
+    /** The latest point in the song read so far. */
+    private var lastSampleUs = C.TIME_UNSET
+    private var toldCutShort = false
 
     override fun sniff(input: ExtractorInput): Boolean = extractor.sniff(input)
 
     override fun init(output: ExtractorOutput) {
         extractor.init(object : ExtractorOutput by output {
+            override fun track(id: Int, type: Int): TrackOutput {
+                val track = output.track(id, type)
+                return object : TrackOutput by track {
+                    override fun sampleMetadata(timeUs: Long, flags: Int, size: Int, offset: Int, cryptoData: TrackOutput.CryptoData?) {
+                        if (timeUs > lastSampleUs) lastSampleUs = timeUs
+                        track.sampleMetadata(timeUs, flags, size, offset, cryptoData)
+                    }
+                }
+            }
+
             override fun seekMap(seekMap: SeekMap) {
                 output.seekMap(
                     if (seekMap.durationUs != C.TIME_UNSET) seekMap
@@ -130,12 +157,24 @@ internal class KnownDurationExtractor(
         })
     }
 
-    override fun read(input: ExtractorInput, seekPosition: PositionHolder): Int =
-        extractor.read(input, seekPosition)
+    override fun read(input: ExtractorInput, seekPosition: PositionHolder): Int {
+        val result = extractor.read(input, seekPosition)
+        if (result == Extractor.RESULT_END_OF_INPUT && !toldCutShort && lastSampleUs != C.TIME_UNSET &&
+            knownDurationUs - lastSampleUs > CUT_SHORT_US) {
+            toldCutShort = true
+            onCutShort(lastSampleUs)
+        }
+        return result
+    }
 
     override fun seek(position: Long, timeUs: Long) = extractor.seek(position, timeUs)
 
     override fun release() = extractor.release()
 
     override fun getUnderlyingImplementation(): Extractor = extractor.underlyingImplementation
+
+    private companion object {
+        /** Ending this far before the song's length isn't the song's own end (lengths are given to the second). */
+        const val CUT_SHORT_US = 10_000_000L
+    }
 }

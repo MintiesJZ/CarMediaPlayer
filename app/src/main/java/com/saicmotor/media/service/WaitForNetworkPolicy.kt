@@ -74,6 +74,16 @@ class WaitForNetworkPolicy : DefaultLoadErrorHandlingPolicy() {
         private const val MAX_WAIT_RETRIES = 600
         private const val OTHER_RETRIES = 3
 
+        /**
+         * Not the song's fault, and worth waiting out: no connection, the
+         * server restarting (5xx) or at its limit of transcodes (429).
+         */
+        fun isTemporary(e: Throwable): Boolean {
+            val http = generateSequence(e) { it.cause }.take(8)
+                .filterIsInstance<HttpDataSource.InvalidResponseCodeException>().firstOrNull()?.responseCode
+            return if (http != null) http >= 500 || http == TOO_MANY_REQUESTS else isConnectionProblem(e)
+        }
+
         /** The server couldn't be reached at all (or the connection dropped). */
         fun isConnectionProblem(e: Throwable): Boolean {
             if (e is HttpDataSource.InvalidResponseCodeException) return false

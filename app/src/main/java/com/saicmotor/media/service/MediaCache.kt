@@ -14,6 +14,7 @@ import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.cache.CacheDataSink
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.ContentMetadata
+import androidx.media3.datasource.cache.ContentMetadataMutations
 import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
@@ -146,6 +147,21 @@ object MediaCache {
         val key = keyFor(mediaId)
         val length = ContentMetadata.getContentLength(c.getContentMetadata(key))
         return length > 0 && c.isCached(key, 0, length)
+    }
+
+    /**
+     * What's kept of a song turned out not to be all of it (the server ended
+     * it early without saying so): the next time it's wanted, the rest is
+     * asked for, where it used to stop short every time.  What's kept stays
+     * (it's the song's first part).
+     */
+    fun notWhole(context: Context, mediaId: String) {
+        try {
+            cache(context).applyContentMetadataMutations(
+                keyFor(mediaId), ContentMetadataMutations().remove(ContentMetadata.KEY_CONTENT_LENGTH))
+        } catch (_: Exception) {
+            // Only the cache: the song then stays as it is until it's dropped.
+        }
     }
 
     /**

@@ -41,7 +41,7 @@ key) and plays **only from a Navidrome server**.
 
 `tools/buildcheck` builds the app's sources with the same dependencies as
 `app/build.gradle` and runs the Robolectric tests in `tools/buildcheck/tests`
-(33 service tests, 13 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
+(33 service tests, 24 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
 `tools/buildcheck/app/build/shots`, 7 against a real Navidrome, skipped
 unless one is running: `tools/navidrome/README.md`, and 33 with the car's own
 launcher — 7 of them with SmartTube too — skipped unless their APKs are
@@ -171,6 +171,19 @@ are the main thread here.
   where it was; the launcher's "switch source" (32769) brings it back.  The
   look-ahead downloader finishes the song it's on but starts no new one until
   the music plays again.
+- **Losing the speakers** (`mediaFocusListener`): for good (the radio,
+  YouTube) → paused; for a moment (a call, a navigation prompt) → paused
+  and carried on afterwards.  Both go by "meant to be playing"
+  (`playWhenReady`), not "playing": a song still loading, or waiting for
+  the network, used to start once it had loaded — over the call, or taking
+  the speakers back from the radio.  Play pressed while they're away for a
+  moment asks for them again (`focusAway`), so the car refuses it during a
+  call.
+- **"Playing" includes loading** (`playingOrLoading`), for the session, the
+  widgets, the notification and the play / pause button: a song loading
+  with play wanted is shown as playing and pause pauses it.  The session is
+  told when play / pause changes while loading too
+  (`onPlayWhenReadyChanged`).
 - **Updating itself**: as a platform-signed system-UID app it holds
   INSTALL_PACKAGES, so `Updater` installs through a PackageInstaller session
   with no prompt (if the installer asks for confirmation anyway, its screen
@@ -226,6 +239,14 @@ are the main thread here.
   the player reads anything earlier from the cache.  The look-ahead leaves a
   song the player's already fetching itself (`playerIsFetching`).
 - `WaitForNetworkPolicy` retries through dead spots instead of failing.
+  When that still ends in an error, the app waits for the network and tries
+  again, for as long as it takes (it used to give up after 15 minutes).
+  Trying again is `prepare()` only: it plays on if the music was meant to
+  be playing and stays paused if the driver paused it (never `play()`).
+- The look-ahead gives up on a song only when the server refuses it (five
+  tries, until the next queue): no connection, a 5xx or a 429 don't count
+  (`WaitForNetworkPolicy.isTemporary`), or a dead spot used up the tries of
+  the very next songs.
 - A song that's still streaming (transcoded: no length, and the Ogg reader
   can't tell its duration) would count as live radio, so a dropped
   connection (Wi-Fi → mobile data leaving home, a dead spot) restarted it
@@ -233,6 +254,14 @@ are the main thread here.
   duration from its details, so it carries on from where it dropped.
   Seeking such a song would also restart it (it isn't seekable until it's
   downloaded), so skipping through it is refused (`seekWouldRestart`).
+  Carrying on part-way when the car starts needs the whole song on disk for
+  the same reason, so the player reads up to ten minutes ahead
+  (`MAX_BUFFER_MS`): the whole of nearly any song, straight away.
+- The known duration also shows a song the server ended early without an
+  error (a transcode that died): the stream ends more than 10 s short
+  (`KnownDurationExtractor`), and what's kept is no longer taken for the
+  whole song (`MediaCache.notWhole` drops its length; the rest is asked for
+  next time).
 - ExoPlayer marks a stream of unknown length "don't cache", so the songs the
   player streamed were never kept; `KeepWhatPlays` clears that, so the song
   playing is on disk for when the car starts with no signal, and the
@@ -247,5 +276,8 @@ are the main thread here.
   has been in touch this start-up (it asks what the app can play as it
   starts): then it's bringing back another source, e.g. the radio left
   paused at switch-off, and the app leaves it.
-- Failed scrobbles are queued and retried (`PendingScrobbles`).
+- Failed scrobbles are queued and retried (`PendingScrobbles`).  A song
+  picked up part-way at start-up, past the point where its play is
+  reported (half-way, or four minutes), was reported before the car was
+  switched off: not again (`startPlayReport`).
 - The log shows how each start-up went ("Startup timing: …").
