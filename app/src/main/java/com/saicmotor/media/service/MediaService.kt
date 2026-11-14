@@ -1965,14 +1965,15 @@ class MediaService : MediaBrowserServiceCompat() {
         }
 
     /**
-     * The server ended a song early without an error (a transcode that
-     * died): what's kept of it isn't the whole song, so it isn't treated as
-     * such — it used to stop short at the same place every time it came up.
-     * Called off the main thread (see SongSourceFactory).
+     * A song ended well short of its listed length: the server cut it short
+     * (a transcode that died), or the listed length is wrong.  The look-ahead
+     * asks the server for the rest the next time it comes to the song (see
+     * MediaCache.cutShort) — it used to stop short at the same place every
+     * time it came up.  Called off the main thread (see SongSourceFactory).
      */
     private fun songCutShort(item: MediaItem, endedMs: Long) {
-        Log.w(TAG, "The server ended ${item.mediaMetadata.title} early (at ${endedMs / 1000} s): not keeping that as the whole song")
-        MediaCache.notWhole(this, item.mediaId)
+        if (!MediaCache.cutShort(this, item.mediaId)) return
+        Log.w(TAG, "${item.mediaMetadata.title} ended early (at ${endedMs / 1000} s): asking the server for the rest before it plays again")
         serviceScope.launch { precached -= item.mediaId }
     }
 

@@ -149,28 +149,54 @@ object MediaCache {
         return length > 0 && c.isCached(key, 0, length)
     }
 
+    /** A song that ended short of its listed length, as kept (bytes): to ask the server about (see [cutShort]). */
+    private const val KEY_RECHECK = "cmp_recheck"
+    /** How long the server said a song is (bytes), the last time it was asked. */
+    private const val KEY_CHECKED = "cmp_checked"
+
     /**
-     * What's kept of a song turned out not to be all of it (the server ended
-     * it early without saying so): the next time it's wanted, the rest is
-     * asked for, where it used to stop short every time.  What's kept stays
-     * (it's the song's first part).
+     * What's kept of a song ended well short of its listed length: either
+     * the server ended it early without saying so (a transcode that died),
+     * or the listed length is wrong (it's from the song's tags).  Which, only
+     * the server can say: the next time the look-ahead comes to the song, it
+     * asks for the rest (see [precache]) — unless the server's already said
+     * that's all.  Until then it's kept and played as it is.
+     *
+     * (It used to be no longer taken for the whole song straight away: the
+     * player then asked for the rest itself at its end, every time if the
+     * length was simply wrong — a whole song's data each play — and with no
+     * signal it waited there for good instead of moving on.)
+     *
+     * False if there's nothing to ask: not all kept, or already asked.
      */
-    fun notWhole(context: Context, mediaId: String) {
-        try {
-            cache(context).applyContentMetadataMutations(
-                keyFor(mediaId), ContentMetadataMutations().remove(ContentMetadata.KEY_CONTENT_LENGTH))
-        } catch (_: Exception) {
-            // Only the cache: the song then stays as it is until it's dropped.
-        }
+    fun cutShort(context: Context, mediaId: String): Boolean = try {
+        val c = cache(context)
+        val key = keyFor(mediaId)
+        val meta = c.getContentMetadata(key)
+        val length = ContentMetadata.getContentLength(meta)
+        if (length == C.LENGTH_UNSET.toLong() || meta.get(KEY_CHECKED, C.LENGTH_UNSET.toLong()) == length) false
+        else { c.applyContentMetadataMutations(key, ContentMetadataMutations().set(KEY_RECHECK, length)); true }
+    } catch (_: Exception) {
+        false   // only the cache: the song then stays as it is
     }
 
     /**
      * Downloads a song into the cache.  Blocking: run it off the main thread.
      * Returns a [CacheWriter] handle via [onStart] so it can be cancelled.
      * While it runs, the player can take the song from it (see [Follow]).
+     *
+     * A song that ended short ([cutShort]) is asked about: the rest is asked
+     * for, and whatever the server sends (more, or nothing) is then the whole
+     * song, not asked about again.  If it can't be asked, it's kept as it was.
      */
     fun precache(context: Context, mediaId: String, uri: Uri, onStart: (CacheWriter) -> Unit) {
         val key = keyFor(mediaId)
+        val cache = cache(context)
+        val recheck = cache.getContentMetadata(key).get(KEY_RECHECK, C.LENGTH_UNSET.toLong())
+        // Not known to be all there, so the rest is asked for.
+        if (recheck != C.LENGTH_UNSET.toLong()) {
+            cache.applyContentMetadataMutations(key, ContentMetadataMutations().remove(ContentMetadata.KEY_CONTENT_LENGTH))
+        }
         val download = LiveDownload(PIECE_BYTES)
         val server = serverFactory(context)
         val source = cacheFactory(context) { Recording(server.createDataSource(), download) }.createDataSource()
@@ -184,6 +210,14 @@ object MediaCache {
         } finally {
             live.remove(key, download)
             download.stopped(complete)
+            if (recheck != C.LENGTH_UNSET.toLong()) {
+                val length = ContentMetadata.getContentLength(cache.getContentMetadata(key))
+                cache.applyContentMetadataMutations(key,
+                    if (complete) ContentMetadataMutations().remove(KEY_RECHECK).set(KEY_CHECKED, length)
+                    // Couldn't ask: as it was, to be asked another time.
+                    else if (length == C.LENGTH_UNSET.toLong()) ContentMetadataMutations().set(ContentMetadata.KEY_CONTENT_LENGTH, recheck)
+                    else ContentMetadataMutations())
+            }
         }
     }
 

@@ -99,7 +99,7 @@ class StreamingTest {
     private fun startPlaying(): MediaService {
         val store = ResumeStore(app)
         val items = server.songs.values.map {
-            ResumeStore.SavedItem("sub:${it.id}", it.title, "Artist", "Album", null, "al1", "ar1", it.seconds * 1_000L)
+            ResumeStore.SavedItem("sub:${it.id}", it.title, "Artist", "Album", null, "al1", "ar1", it.listedSeconds * 1_000L)
         }
         store.saveQueue(MediaService.ONLINE_ROOT, ResumeStore.QueueKind.BROWSE, MediaService.albumNodeId("al1"))
         store.saveItem(items.first(), 0L)
@@ -669,24 +669,59 @@ class StreamingTest {
 
     /**
      * The server ends a song early without an error (a transcode that died):
-     * the next time, the rest is asked for and the whole song plays.  (What
-     * came was kept as the whole song, which then stopped short every time.)
+     * the next time it comes up, the look-ahead asks for the rest first, and
+     * the whole song plays.  (What came was kept as the whole song, which
+     * then stopped short every time.)
      */
     @Test
     fun aSongTheServerCutShortIsWholeNextTime() {
-        server.addSongs(2, seconds = 20)
-        server.plan = { song, attempt -> if (song == 0 && attempt == 1) FakeNavidrome.Reply.EndAfter(100_000) else FakeNavidrome.Reply.Whole }
+        server.addSongs(3, seconds = 20)
+        server.plan = { song, attempt -> if (song == 1 && attempt == 1) FakeNavidrome.Reply.EndAfter(100_000) else FakeNavidrome.Reply.Whole }
         val first = startPlaying()
-        drive(first, 60_000, until = { heardAll(1) })
-        assertTrue("cut short the first time", !heardAll(0))
+        drive(first, 60_000, until = { heardAll(2) })
+        assertTrue("cut short the first time", !heardAll(1))
         first.onDestroy()
         freshCache(); heard.clear()
         val s = startPlaying()
-        drive(s, 60_000, until = { heardAll(1) })
-        assertHeardWhole(0)
-        assertKeptWhole(0)
-        assertEquals("only the rest was asked for", "bytes=100000-", streamRequests(0).last().range)
+        drive(s, 60_000, until = { heardAll(2) })
+        assertHeardWhole(1)
+        assertKeptWhole(1)
+        assertEquals("only the rest was asked for", "bytes=100000-", streamRequests(1).last().range)
         s.onDestroy()
+    }
+
+    /**
+     * Navidrome lists a song as longer than it is (the length is from its
+     * tags, which can be wrong): the server's asked once whether there's more
+     * — and isn't again — and with no signal the music plays through the song
+     * and on.  (Taken for a song the server had cut short, it was fetched
+     * again from the server at every play, and with no signal the music
+     * stopped for good at the song's end.)
+     */
+    @Test
+    fun aSongListedAsLongerThanItIsIsAskedAboutOnce() {
+        server.addSongs(1, seconds = 20)
+        server.addSongs(1, seconds = 20, listedSeconds = 45)
+        server.addSongs(1, seconds = 20)
+        fun run() {
+            freshCache(); heard.clear()
+            val s = startPlaying()
+            drive(s, 60_000, until = { heardAll(2) })
+            assertTrue("played through: ${heard.groupBy { it.first }.mapValues { it.value.size }}", heardAll(0) && heardAll(1) && heardAll(2))
+            s.onDestroy()
+        }
+        // Found short of its listed length, and the server's asked about the
+        // rest (once it's been read ahead, or the next time it comes up).
+        run()
+        run()
+        val asked = streamRequests(1).map { it.range }
+        assertEquals("fetched, then asked about once: $asked", 2, asked.size)
+        assertTrue("for the rest: $asked", asked.last()?.startsWith("bytes=") == true)
+        assertKeptWhole(1)
+        run()
+        assertEquals("not asked again", 2, streamRequests(1).size)
+        server.goDown()
+        run()                                   // no signal: through it and on
     }
 
     /**

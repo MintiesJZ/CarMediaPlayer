@@ -29,7 +29,9 @@ import kotlin.random.Random
  */
 class FakeNavidrome : AutoCloseable {
 
-    class Song(val id: String, val title: String, val seconds: Int, index: Int) {
+    class Song(val id: String, val title: String, val seconds: Int, index: Int,
+               /** How long the server says it is (taken from its tags: not always right). */
+               val listedSeconds: Int = seconds) {
         /** The song as ffmpeg makes it (before its serial number). */
         val opus: ByteArray = OggOpus.song(seconds, songNumber = index)
     }
@@ -77,9 +79,10 @@ class FakeNavidrome : AutoCloseable {
     val url get() = "http://127.0.0.1:$port"
 
     /** Ids are new each time: the song cache outlives a test. */
-    fun addSongs(count: Int, seconds: Int, prefix: String = "t${System.nanoTime() % 1_000_000}s"): List<Song> =
+    fun addSongs(count: Int, seconds: Int, prefix: String = "t${System.nanoTime() % 1_000_000}s",
+                 listedSeconds: Int = seconds): List<Song> =
         (0 until count).map { i ->
-            Song("$prefix$i", "Song $i", seconds, songs.size).also { songs[it.id] = it }
+            Song("$prefix$i", "Song $i", seconds, songs.size, listedSeconds).also { songs[it.id] = it }
         }
 
     fun streamRequests(id: String) = requests.filter { it.endpoint == "stream" && it.params["id"] == id }
@@ -153,7 +156,7 @@ class FakeNavidrome : AutoCloseable {
     }
 
     private fun songJson(s: Song) =
-        """{"id":"${s.id}","title":"${s.title}","artist":"Artist","album":"Album","albumId":"al1","artistId":"ar1","duration":${s.seconds}}"""
+        """{"id":"${s.id}","title":"${s.title}","artist":"Artist","album":"Album","albumId":"al1","artistId":"ar1","duration":${s.listedSeconds}}"""
 
     private fun error(code: Int, message: String) = "\"error\":{\"code\":$code,\"message\":\"$message\"}"
 

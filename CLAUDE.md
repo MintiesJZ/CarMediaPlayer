@@ -47,7 +47,7 @@ key) and plays **only from a Navidrome server**.
 
 `tools/buildcheck` builds the app's sources with the same dependencies as
 `app/build.gradle` and runs the Robolectric tests in `tools/buildcheck/tests`
-(42 service tests, 24 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
+(42 service tests, 25 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
 `tools/buildcheck/app/build/shots`, 7 against a real Navidrome, skipped
 unless one is running: `tools/navidrome/README.md`, and 33 with the car's own
 launcher — 7 of them with SmartTube too — skipped unless their APKs are
@@ -271,11 +271,17 @@ are the main thread here.
   Carrying on part-way when the car starts needs the whole song on disk for
   the same reason, so the player reads up to ten minutes ahead
   (`MAX_BUFFER_MS`): the whole of nearly any song, straight away.
-- The known duration also shows a song the server ended early without an
-  error (a transcode that died): the stream ends more than 10 s short
-  (`KnownDurationExtractor`), and what's kept is no longer taken for the
-  whole song (`MediaCache.notWhole` drops its length; the rest is asked for
-  next time).
+- The known duration also shows a song that ends more than 10 s short of
+  it (`KnownDurationExtractor`): the server ended it early without an error
+  (a transcode that died), or the listed length is wrong (Navidrome takes
+  it from the tags; VBR MP3s can be well out).  Only the server can say
+  which, so the look-ahead asks it once, ahead of the song's next play
+  (`MediaCache.cutShort` marks it; `precache` drops its length, fetches the
+  rest, then notes the server's answer and never asks again).  Until then
+  the copy plays as it is.  (1.0.13 dropped the length at once, so the
+  player asked at the song's end every play — a whole song's data each
+  time when the length was simply wrong — and with no signal it waited
+  there for good instead of moving on.)
 - ExoPlayer marks a stream of unknown length "don't cache", so the songs the
   player streamed were never kept; `KeepWhatPlays` clears that, so the song
   playing is on disk for when the car starts with no signal, and the
