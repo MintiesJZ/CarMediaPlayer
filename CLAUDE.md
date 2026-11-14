@@ -54,7 +54,7 @@ key) and plays **only from a Navidrome server**.
 
 `tools/buildcheck` builds the app's sources with the same dependencies as
 `app/build.gradle` and runs the Robolectric tests in `tools/buildcheck/tests`
-(43 service tests, 25 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
+(44 service tests, 25 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
 `tools/buildcheck/app/build/shots`, 7 against a real Navidrome, skipped
 unless one is running: `tools/navidrome/README.md`, and 33 with the car's own
 launcher — 7 of them with SmartTube too — skipped unless their APKs are
@@ -225,6 +225,12 @@ are the main thread here.
   service was started (player, decoder and audio track, 12–15 s after boot),
   the adapter service ran a second late and the launcher asked a second
   later too — no sooner for the music, and an orange battery most days.
+  (Since: the adapter service subscribes ~14.5 s after boot, the HAL's pass
+  is at 15.1–15.4 s, the launcher asks at ~15.8 s and the music plays
+  ~1.5 s after that — nearly all of it first-time work on a busy head
+  unit.)  One thing is done ahead: the saved queue's small file is read on
+  a thread at the lowest priority (`readSavedQueueAhead`), and used when the
+  launcher asks if it's done by then; it never touches the player.
   In a logcat: `LAU.EvBatteryView: onChargePercentChange: percent: 98,range=-1,…`
   is orange, `range=0` green; `[CarAdapterSettingManager]
   ID_IMCU_VEHICLE_ELECTRIC_RANGE_DSP_CMD = 0` is the signal being heard.
@@ -339,4 +345,12 @@ are the main thread here.
   picked up part-way at start-up, past the point where its play is
   reported (half-way, or four minutes), was reported before the car was
   switched off: not again (`startPlayReport`).
-- The log shows how each start-up went ("Startup timing: …").
+- The log shows how each start-up went ("Startup timing: …": when the
+  launcher asked, the saved queue was read, the queue was back in the
+  player, the first song had loaded, and the music played).
+- The head unit's network passes nothing for most of the first minute after
+  it boots (and the server may not be reachable for a while after that):
+  the music plays from disk meanwhile and look-ahead downloads are tried
+  again; the log says why each one failed (`WaitForNetworkPolicy.reason`,
+  in words — never the error's own message, which can hold the song's
+  address and so the login).

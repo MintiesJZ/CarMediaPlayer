@@ -322,6 +322,40 @@ class ServiceTest {
     }
 
     /**
+     * The one thing done ahead while the car starts: the saved queue is
+     * read, on a thread that gives way to everything, so that's done when
+     * the launcher asks.  It's what would be read then — unless the server
+     * or login has changed since.
+     */
+    @Test
+    fun theSavedQueueIsReadAheadWithoutTouchingThePlayer() {
+        fun MediaService.readAhead() = MediaService::class.java.getDeclaredField("savedQueueAhead")
+            .apply { isAccessible = true }.get(this) as java.util.concurrent.atomic.AtomicReference<*>?
+        fun address(s: MediaService) = s.player().currentMediaItem?.localConfiguration?.uri.toString()
+        savePlayingState()
+        val s = service()
+        val read = s.readAhead()!!
+        waitFor { read.get() != null }
+        assertEquals("the player's left alone", 0, s.player().mediaItemCount)
+        s.restoredByLauncher()
+        assertEquals(8, s.player().mediaItemCount)
+        assertEquals("sub:s3", s.player().currentMediaItem?.mediaId)
+        assertEquals(42_000L, s.player().currentPosition)
+        assertTrue(address(s), "u=me&" in address(s))
+        assertEquals("used once", null, s.readAhead())
+        s.onDestroy()
+
+        // The login's changed in Settings before the launcher asks: read again, for the new one.
+        val second = service()
+        val again = second.readAhead()!!
+        waitFor { again.get() != null }
+        SubsonicSettings.save(app, SubsonicSettings.Config("http://127.0.0.1:9", "someone", "secret"))
+        second.restoredByLauncher()
+        assertEquals("sub:s3", second.player().currentMediaItem?.mediaId)
+        assertTrue(address(second), "u=someone&" in address(second))
+    }
+
+    /**
      * Woken from sleep, the car's services are already running: the queue
      * is got ready (paused) for the launcher's "play" a few seconds later.
      */
@@ -399,6 +433,13 @@ class ServiceTest {
         assertEquals(androidx.media3.common.C.TIME_UNSET, delay(http(404)))
         assertEquals(androidx.media3.common.C.TIME_UNSET, delay(java.io.IOException("bad file"), 4))
         assertEquals(Int.MAX_VALUE, policy.getMinimumLoadableRetryCount(androidx.media3.common.C.DATA_TYPE_MEDIA))
+        // What the log says about each — in words, never the address (it carries the login).
+        val why = com.saicmotor.media.service.WaitForNetworkPolicy.Companion::reason
+        assertEquals("the server's name wasn't found — no connection yet?", why(noNetwork))
+        assertEquals("the server answered 503", why(http(503)))
+        assertEquals("no answer from the server in time", why(java.io.IOException(java.net.SocketTimeoutException("http://x/rest/stream?u=me"))))
+        assertEquals("the server refused the login (40)", why(java.io.IOException(com.saicmotor.media.service.SongRefused("s1", 40, "Wrong username or password"))))
+        assertEquals("IOException", why(java.io.IOException("http://x/rest/stream?u=me")))
     }
 
     /** The launcher asks for "paused" when it last saw the music paused: start-up plays anyway. */

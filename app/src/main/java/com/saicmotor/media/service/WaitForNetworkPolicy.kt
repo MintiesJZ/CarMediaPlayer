@@ -84,6 +84,26 @@ class WaitForNetworkPolicy : DefaultLoadErrorHandlingPolicy() {
             return if (http != null) http >= 500 || http == TOO_MANY_REQUESTS else isConnectionProblem(e)
         }
 
+        /**
+         * Why a song couldn't be fetched, in a few words for the log.  Never
+         * the error's own message: it can hold the song's address, which
+         * carries the login.
+         */
+        fun reason(e: Throwable): String {
+            val chain = generateSequence(e) { it.cause }.take(8).toList()
+            chain.filterIsInstance<HttpDataSource.InvalidResponseCodeException>().firstOrNull()
+                ?.let { return "the server answered ${it.responseCode}" }
+            chain.filterIsInstance<SongRefused>().firstOrNull()
+                ?.let { return if (it.loginRefused) "the server refused the login (${it.code})" else "the server refused it (${it.code})" }
+            for (cause in chain) when (cause) {
+                is UnknownHostException   -> return "the server's name wasn't found — no connection yet?"
+                is SocketTimeoutException -> return "no answer from the server in time"
+                is ConnectException, is NoRouteToHostException -> return "couldn't connect to the server"
+                is SocketException        -> return "the connection dropped"
+            }
+            return chain.last().javaClass.simpleName
+        }
+
         /** The server couldn't be reached at all (or the connection dropped). */
         fun isConnectionProblem(e: Throwable): Boolean {
             if (e is HttpDataSource.InvalidResponseCodeException) return false

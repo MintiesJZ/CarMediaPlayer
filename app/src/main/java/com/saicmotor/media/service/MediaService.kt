@@ -11,6 +11,7 @@ import android.content.IntentFilter
 import android.database.ContentObserver
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import android.graphics.Bitmap
 import android.graphics.drawable.BitmapDrawable
 import android.media.AudioFocusRequest
@@ -71,6 +72,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 import kotlin.random.Random
 
 /**
@@ -413,6 +416,8 @@ class MediaService : MediaBrowserServiceCompat() {
     private var traceFrom       = -1L
     private var traceQueueAt    = -1L
     private var traceLauncherAt = -1L
+    private var traceReadAt     = -1L   // the saved queue read
+    private var traceLoadedAt   = -1L   // the first song loaded far enough to play
     private var traceOnDiskPct  = -1
     /** Music was started for the driver (launcher or boot fallback), not by a press. */
     private var traceAuto       = false
@@ -817,7 +822,34 @@ class MediaService : MediaBrowserServiceCompat() {
         // queue ready here (1.0 – 1.0.15) left the launcher's battery diagram
         // orange for the drive, and the launcher asking a second later.
         if (carryOnAfterCrash()) return
-        if (SystemClock.elapsedRealtime() < STARTUP_WINDOW_MS) startTrace(0L)
+        if (SystemClock.elapsedRealtime() < STARTUP_WINDOW_MS) {
+            startTrace(0L)
+            readSavedQueueAhead()
+        }
+    }
+
+    /** The saved queue as [readSavedQueueAhead] read it, for the server and login it was read with. */
+    private class SavedQueue(val config: SubsonicSettings.Config, val items: List<MediaItem>)
+    private var savedQueueAhead: AtomicReference<SavedQueue?>? = null
+
+    /**
+     * Reads the saved queue while waiting for the launcher to ask for the
+     * music, so that's done when it does: a small file, read and turned into
+     * songs on one thread that gives way to everything else — the one thing
+     * done ahead while the car starts (see [onCreate]).  Nothing touches
+     * the player.
+     */
+    private fun readSavedQueueAhead() {
+        if (PlaybackSettings.startupMode(this) == PlaybackSettings.StartupMode.NOTHING) return
+        val config = subsonicCfg() ?: return
+        val read = AtomicReference<SavedQueue?>()
+        savedQueueAhead = read
+        thread(name = "CarMedia:SavedQueue", isDaemon = true) {
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_LOWEST)
+                read.set(SavedQueue(config, resumeStore.loadSnapshot().mapNotNull { savedToPlayable(it, config) }))
+            } catch (_: Exception) {}
+        }
     }
 
     // ── Carrying on after stopping unexpectedly ────────────────────────────
@@ -1005,6 +1037,7 @@ class MediaService : MediaBrowserServiceCompat() {
         }
         override fun onPlaybackStateChanged(playbackState: Int) {
             if (playbackState == Player.STATE_READY) {
+                traceSongLoaded()
                 streamRetries = 0
                 loginRefused = false
                 endNetworkWait()
@@ -1946,7 +1979,7 @@ class MediaService : MediaBrowserServiceCompat() {
                         if (!WaitForNetworkPolicy.isTemporary(error)) {
                             downloadFailures[id] = (downloadFailures[id] ?: 0) + 1
                         }
-                        Log.i(TAG, "Couldn't download ahead: ${target.mediaMetadata.title} — trying again shortly")
+                        Log.i(TAG, "Couldn't download ahead: ${target.mediaMetadata.title} (${WaitForNetworkPolicy.reason(error)}) — trying again shortly")
                         delay(DOWNLOAD_RETRY_MS)   // probably the network: give it a moment
                     }
                 }
@@ -2092,6 +2125,7 @@ class MediaService : MediaBrowserServiceCompat() {
         play:            Boolean = true
     ) {
         if (items.isEmpty()) return
+        savedQueueAhead = null   // what was saved when the car started is no longer the queue
         queueGeneration++
         queueKind     = kind
         streamRetries = 0
@@ -2100,12 +2134,15 @@ class MediaService : MediaBrowserServiceCompat() {
         stopFastSeek()
 
         val start = startIndex.coerceIn(0, items.size - 1)
-        // Push metadata straight away so the launcher sees the right title
-        // before ExoPlayer's callbacks arrive.
-        session.setMetadata(buildMetadata(items[start], durationMs = durationHintMs))
+        // The player first: it loads the song on its own threads while the
+        // rest of this is done here (when the car starts, each step takes
+        // its time, and the music was waiting for all of them).
         player.setMediaItems(items, start, startPositionMs)
         applyShuffleOrder(start)
         player.prepare()
+        // The metadata straight away, so the launcher sees the right title
+        // before ExoPlayer's callbacks arrive.
+        session.setMetadata(buildMetadata(items[start], durationMs = durationHintMs))
 
         resumeStore.saveQueue(ONLINE_ROOT, kind, parentId)
         saveCurrentItem(items[start], startPositionMs)
@@ -2462,8 +2499,13 @@ class MediaService : MediaBrowserServiceCompat() {
         // that, so carry on with it; any other saved queue isn't.
         if (mode == PlaybackSettings.StartupMode.SHUFFLE_LIBRARY && !library) return false
         val cfg = subsonicCfg() ?: return false
-        val snapshot = withContext(Dispatchers.IO) { resumeStore.loadSnapshot() }
-        val items = snapshot.mapNotNull { savedToPlayable(it, cfg) }
+        // Read ahead as the car started — if that's done (it isn't waited
+        // for: its thread gives way to everything), this is the first queue
+        // since, and the server and login are still those it was read with.
+        val ahead = savedQueueAhead?.also { savedQueueAhead = null }?.get()?.takeIf { it.config == cfg }
+        val items = ahead?.items
+            ?: withContext(Dispatchers.IO) { resumeStore.loadSnapshot() }.mapNotNull { savedToPlayable(it, cfg) }
+        traceQueueRead()
         if (items.isEmpty()) return false
         val current = saved.item?.let { s -> items.indexOfFirst { it.mediaId == s.mediaId } } ?: -1
         var start    = current.coerceAtLeast(0)
@@ -2491,6 +2533,8 @@ class MediaService : MediaBrowserServiceCompat() {
         traceFrom       = from
         traceQueueAt    = -1L
         traceLauncherAt = -1L
+        traceReadAt     = -1L
+        traceLoadedAt   = -1L
         traceOnDiskPct  = -1
         traceAuto       = false
     }
@@ -2498,6 +2542,14 @@ class MediaService : MediaBrowserServiceCompat() {
     private fun traceLauncherAsked() {
         traceAuto = true
         if (traceFrom >= 0 && traceLauncherAt < 0) traceLauncherAt = SystemClock.elapsedRealtime()
+    }
+
+    private fun traceQueueRead() {
+        if (traceFrom >= 0 && traceReadAt < 0) traceReadAt = SystemClock.elapsedRealtime()
+    }
+
+    private fun traceSongLoaded() {
+        if (traceFrom >= 0 && traceQueueAt >= 0 && traceLoadedAt < 0) traceLoadedAt = SystemClock.elapsedRealtime()
     }
 
     private fun traceQueueReady(mediaId: String) {
@@ -2519,7 +2571,8 @@ class MediaService : MediaBrowserServiceCompat() {
         if (now - from > STARTUP_WINDOW_MS * 2) return   // not a start-up any more
         fun rel(t: Long) = if (t >= 0) t - from else -1L
         val onDisk = if (traceOnDiskPct == PARTLY) "partly" else "$traceOnDiskPct%"
-        Log.i(TAG, "Startup timing: queue back ${rel(traceQueueAt)} ms, launcher asked ${rel(traceLauncherAt)} ms, " +
+        Log.i(TAG, "Startup timing: launcher asked ${rel(traceLauncherAt)} ms, queue read ${rel(traceReadAt)} ms, " +
+            "queue back ${rel(traceQueueAt)} ms, song loaded ${rel(traceLoadedAt)} ms, " +
             "playing ${now - from} ms after the head unit started; first song $onDisk on disk")
     }
 
