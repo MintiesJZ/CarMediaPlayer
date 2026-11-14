@@ -182,10 +182,14 @@ object Updater {
         return Release(version, "$releases/download/$tag/${apkName(version)}")
     }
 
-    /** "2.0.10" is newer than "2.0.9" (compared number by number). */
+    /**
+     * "2.0.10" is newer than "2.0.9" (compared number by number).  A test
+     * build of a version ("2.0.10-pre1", a pre-release) comes before the
+     * version itself, and before its "-pre2".
+     */
     @VisibleForTesting
     internal fun isNewer(candidate: String, installed: String): Boolean {
-        fun parts(v: String) = v.split('.', '-', ' ').map { p -> p.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
+        fun parts(v: String) = v.substringBefore('-').split('.', ' ').map { p -> p.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
         val a = parts(candidate)
         val b = parts(installed)
         for (i in 0 until maxOf(a.size, b.size)) {
@@ -193,7 +197,9 @@ object Updater {
             val y = b.getOrElse(i) { 0 }
             if (x != y) return x > y
         }
-        return false
+        // The same version: which test build of it, if either is one.
+        fun test(v: String) = if ('-' in v) v.substringAfter('-').filter(Char::isDigit).toIntOrNull() ?: 0 else Int.MAX_VALUE
+        return test(candidate) > test(installed)
     }
 
     private fun download(context: Context, release: Release): File {

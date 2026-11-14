@@ -30,6 +30,13 @@ key) and plays **only from a Navidrome server**.
   and must keep rising (Check for updates compares names).  versionCode
   carries on from the alpha versions (1.0 is 2000000018) and must keep
   rising too, or the head unit refuses the update.
+- **Test builds** (pre-releases): a versionName with a "-" in it,
+  `1.0.16-pre1` (then `-pre2`, then `1.0.16` itself; versionCode +1 each
+  time), is published by the workflow as a GitHub pre-release.  *Check for
+  updates* doesn't offer it (GitHub's "latest release" leaves pre-releases
+  out): it's installed by hand, from the APK on the release's page.  Once
+  the version itself is released, *Check for updates* on the test build
+  installs it (`Updater.isNewer`).
 - The version commit's message is the release's notes (the workflow drops
   the title line): **short, plain dot points only** — a few words each,
   one per change, no explanations (e.g. "- Autoplay when car starts.").

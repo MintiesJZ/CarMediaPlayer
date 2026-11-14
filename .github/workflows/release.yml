@@ -6,6 +6,10 @@ name: Release
 # is public) and publishes it as release "v<versionName>".  Settings → Check
 # for updates in the app installs the latest release.
 #
+# A versionName with a "-" in it (1.0.16-pre1) is a test build: published as
+# a pre-release, which isn't "the latest release", so Check for updates
+# doesn't offer it — it's installed by hand, from the release's page.
+#
 # Nothing is published if the tests fail, the two build files disagree on
 # the version, or the downloaded key isn't the car's platform key.
 
@@ -128,6 +132,11 @@ jobs:
             | grep -v -e '^Co-Authored-By:' -e '^Claude-Session:' \
             | awk 'BEGIN { RS = ""; ORS = "\n\n" } { if ($0 !~ /(^|\n)- /) gsub(/\n/, " "); print }' > notes.md || true
           [ -s notes.md ] || git log -1 --format=%s "${c:-$GITHUB_SHA}" > notes.md
+          # A test build ("1.0.16-pre1") is a pre-release, never "the latest".
+          case "$VERSION" in
+            *-*) kind="--prerelease --latest=false" ;;
+            *)   kind="--latest" ;;
+          esac
           gh release create "v$VERSION" "dist/CarMediaPlayer-$VERSION-MG4-platform-signed.apk" \
             -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "$VERSION" --notes-file notes.md --latest
+            --title "$VERSION" --notes-file notes.md $kind

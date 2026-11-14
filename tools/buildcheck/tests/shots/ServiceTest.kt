@@ -488,6 +488,14 @@ class ServiceTest {
         assertFalse(u.isNewer("2.0.9", "2.0.9"))
         assertFalse(u.isNewer("2.0.9", "2.0.10"))
         assertFalse(u.isNewer("2.0", "2.0.0"))
+        // A test build (a pre-release) comes before its version, and is replaced by it.
+        assertTrue(u.isNewer("2.0.10", "2.0.10-pre1"))
+        assertTrue(u.isNewer("2.0.10-pre2", "2.0.10-pre1"))
+        assertTrue(u.isNewer("2.0.10-pre1", "2.0.9"))
+        assertFalse(u.isNewer("2.0.10-pre1", "2.0.10"))
+        assertFalse(u.isNewer("2.0.10-pre1", "2.0.10-pre1"))
+        assertFalse("the latest release while a test build is installed", u.isNewer("2.0.9", "2.0.10-pre1"))
+        assertEquals("2.0.10-pre1", u.latestFrom("https://github.com/${u.REPO}/releases/tag/v2.0.10-pre1")!!.version)
     }
 
     @Test
