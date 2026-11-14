@@ -810,14 +810,14 @@ class MediaService : MediaBrowserServiceCompat() {
 
         // Started again by Android after stopping unexpectedly while the
         // music was playing: carry on.  Otherwise the launcher starts this
-        // service as the head unit comes up: put the last queue back straight
-        // away (paused, loading) so the song is ready the moment the launcher
-        // asks for music, ~10 s later.
+        // service as the head unit comes up and asks for the music a few
+        // seconds later: the queue is put back then, not now.  Until it asks
+        // the car's own services are still starting, and they must not be
+        // held up (see CLAUDE.md, "Quiet while the car starts"): getting the
+        // queue ready here (1.0 – 1.0.15) left the launcher's battery diagram
+        // orange for the drive, and the launcher asking a second later.
         if (carryOnAfterCrash()) return
-        if (SystemClock.elapsedRealtime() < STARTUP_WINDOW_MS) {
-            startTrace(0L)
-            prepareForStartup()
-        }
+        if (SystemClock.elapsedRealtime() < STARTUP_WINDOW_MS) startTrace(0L)
     }
 
     // ── Carrying on after stopping unexpectedly ────────────────────────────
@@ -901,9 +901,10 @@ class MediaService : MediaBrowserServiceCompat() {
     }
 
     /**
-     * Puts the saved queue back, paused but loading (from the song cache
-     * where it can), ready for the launcher's "play" (or "pause") a few
-     * seconds later.
+     * Woken from sleep (the car's services are already running): puts the
+     * saved queue back, paused but loading (from the song cache where it
+     * can), ready for the launcher's "play" (or "pause") a few seconds later.
+     * Not when the head unit boots: see [onCreate].
      */
     private fun prepareForStartup() {
         if (player.mediaItemCount > 0) return

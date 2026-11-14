@@ -79,6 +79,12 @@ class ServiceTest {
         looper.idle()
     }
 
+    /** The time a restore would take (it reads its file on a background thread), for when none is expected. */
+    private fun settle() {
+        repeat(40) { looper.idle(); Thread.sleep(5) }
+        looper.idle()
+    }
+
     private fun MediaService.restoredByLauncher(event: Int = CommandParcelable.SWITCH_SOURCE_ONLY_PLAY) {
         onStartCommand(launcherCommand(event), 0, 1)
         waitFor { player().mediaItemCount > 0 }
@@ -189,7 +195,7 @@ class ServiceTest {
     fun launcherGetsTheCoverBitmapNotAUrl() {
         savePlayingState()
         val s = service()
-        waitFor { s.player().mediaItemCount > 0 }
+        s.restoredByLauncher()
         val meta = s.call("buildMetadata", s.player().currentMediaItem, null) as android.support.v4.media.MediaMetadataCompat
         assertEquals(null, meta.getString(android.support.v4.media.MediaMetadataCompat.METADATA_KEY_ALBUM_ART_URI))
         assertEquals("Song 3", meta.getString(android.support.v4.media.MediaMetadataCompat.METADATA_KEY_TITLE))
@@ -288,34 +294,69 @@ class ServiceTest {
         println("launcher start-up restore: OK")
     }
 
+    /**
+     * While the head unit boots the app stays quiet: the launcher starts it
+     * seconds before it asks for the music, and the car's own services are
+     * still starting then.  Getting the queue ready meanwhile (1.0 – 1.0.15)
+     * held them up: one missed the car's signals, the launcher's battery
+     * diagram stayed orange for the drive, and the launcher asked later.
+     */
     @Test
-    fun queueIsReadyBeforeTheLauncherAsks() {
+    fun theQueueWaitsForTheLauncherWhileTheCarStarts() {
         savePlayingState()
         val s = service()                  // started by the launcher as the head unit comes up
-        waitFor { s.player().mediaItemCount > 0 }
+        idle(5_000)
+        settle()
         val p = s.player()
+        assertEquals("nothing loaded until the launcher asks", 0, p.mediaItemCount)
+        assertEquals(androidx.media3.common.Player.STATE_IDLE, p.playbackState)
+        s.restoredByLauncher()
         assertEquals("sub:s3", p.currentMediaItem?.mediaId)
-        assertFalse("ready, but waiting for the launcher", p.playWhenReady)
-        s.onStartCommand(launcherCommand(CommandParcelable.SWITCH_SOURCE_ONLY_PLAY), 0, 1)
-        looper.idle()
         assertTrue(p.playWhenReady)
         assertEquals(42_000L, p.currentPosition)
-        // The timing logged: the queue was back before the launcher asked.
+        // The timing logged: the launcher asked, then the queue came back.
         fun field(name: String) = MediaService::class.java.getDeclaredField(name).apply { isAccessible = true }.get(s)
-        assertTrue((field("traceQueueAt") as Long) in 0..(field("traceLauncherAt") as Long))
+        assertTrue((field("traceLauncherAt") as Long) in 0..(field("traceQueueAt") as Long))
         assertEquals(0, field("traceOnDiskPct"))
         s.call("finishTrace")
     }
 
+    /**
+     * Woken from sleep, the car's services are already running: the queue
+     * is got ready (paused) for the launcher's "play" a few seconds later.
+     */
     @Test
-    fun bootFallbackPlaysAPreparedQueueIfTheLauncherNeverAsks() {
+    fun wokenFromSleepTheQueueIsReadyBeforeTheLauncherAsks() {
         savePlayingState()
         val s = service()
+        idle(6 * 60_000)                   // asleep since the last drive
+        assertEquals(0, s.player().mediaItemCount)
+        s.onStartCommand(Intent(app, MediaService::class.java).setAction(MediaService.ACTION_BOOT_START), 0, 1)
         waitFor { s.player().mediaItemCount > 0 }
+        val p = s.player()
+        assertEquals("sub:s3", p.currentMediaItem?.mediaId)
+        assertFalse("ready, but waiting for the launcher", p.playWhenReady)
+        s.onStartCommand(launcherCommand(CommandParcelable.SWITCH_SOURCE_ONLY_PLAY), 0, 2)
+        looper.idle()
+        assertTrue(p.playWhenReady)
+        assertEquals(42_000L, p.currentPosition)
+        fun field(name: String) = MediaService::class.java.getDeclaredField(name).apply { isAccessible = true }.get(s)
+        assertTrue((field("traceQueueAt") as Long) in 0..(field("traceLauncherAt") as Long))
+        s.call("finishTrace")
+    }
+
+    /** The launcher never asks (and hasn't been in touch): the app starts the music itself. */
+    @Test
+    fun bootFallbackPlaysIfTheLauncherNeverAsks() {
+        savePlayingState()
+        val s = service()
         s.onStartCommand(Intent(app, MediaService::class.java).setAction(MediaService.ACTION_BOOT_START), 0, 1)
         idle(24_000)
-        assertFalse(s.player().playWhenReady)
+        settle()
+        assertEquals("still quiet", 0, s.player().mediaItemCount)
         idle(2_000)
+        waitFor { s.player().mediaItemCount > 0 }
+        assertEquals("sub:s3", s.player().currentMediaItem?.mediaId)
         assertTrue(s.player().playWhenReady)
     }
 
@@ -329,10 +370,11 @@ class ServiceTest {
         savePlayingState()
         val s = service()
         s.onStartCommand(launcherCommand(CommandParcelable.UPDATE_SOURCE_AVAILABLE), 0, 1)
-        waitFor { s.player().mediaItemCount > 0 }
         s.onStartCommand(Intent(app, MediaService::class.java).setAction(MediaService.ACTION_BOOT_START), 0, 2)
         idle(30_000)
+        settle()
         assertFalse(s.player().playWhenReady)
+        assertEquals("nothing loaded either", 0, s.player().mediaItemCount)
     }
 
     @Test
@@ -1003,10 +1045,10 @@ class ServiceTest {
     }
 
     /** Android starts the app again a few seconds later; nothing asks it to play. */
-    private fun startedAgain(): MediaService {
+    private fun startedAgain(carriesOn: Boolean = true): MediaService {
         idle(3_000)
         val s = service()
-        waitFor { s.player().mediaItemCount > 0 }
+        if (carriesOn) waitFor { s.player().mediaItemCount > 0 } else settle()
         idle(1_000)
         return s
     }
@@ -1029,14 +1071,14 @@ class ServiceTest {
         idle(500)
         assertEquals("no longer noted as playing", null, ResumeStore(app).loadPlaying())
         first.crash()
-        assertFalse(startedAgain().player().playWhenReady)
+        assertFalse(startedAgain(carriesOn = false).player().playWhenReady)
     }
 
     /** Stopped on purpose (not a crash): nothing's carried on. */
     @Test
     fun stoppedOnPurposeIsntCarriedOn() {
         playingMidDrive().onDestroy()
-        assertFalse(startedAgain().player().playWhenReady)
+        assertFalse(startedAgain(carriesOn = false).player().playWhenReady)
     }
 
     /**
@@ -1050,16 +1092,16 @@ class ServiceTest {
         Settings.Global.putInt(app.contentResolver, Settings.Global.BOOT_COUNT, 7)
         playingMidDrive().crash()
         Settings.Global.putInt(app.contentResolver, Settings.Global.BOOT_COUNT, 8)
-        assertFalse("a new run of the head unit", startedAgain().player().playWhenReady)
+        assertFalse("a new run of the head unit", startedAgain(carriesOn = false).player().playWhenReady)
         // …whose clock starts again (were its count not kept)…
         val store = ResumeStore(app)
         store.savePlaying(ResumeStore.Playing(SystemClock.elapsedRealtime() + 3_600_000, 8, 0))
-        val second = startedAgain()
+        val second = startedAgain(carriesOn = false)
         assertFalse("last seen playing later than now", second.player().playWhenReady)
         second.onDestroy()
         // …and playing long ago isn't "just now".
         store.savePlaying(ResumeStore.Playing(SystemClock.elapsedRealtime() - 10 * 60_000, 8, 0))
-        assertFalse("long ago", startedAgain().player().playWhenReady)
+        assertFalse("long ago", startedAgain(carriesOn = false).player().playWhenReady)
     }
 
     /** After an update the updater carries on (BootReceiver), not this. */
@@ -1068,7 +1110,7 @@ class ServiceTest {
         playingMidDrive().crash()
         val store = ResumeStore(app)
         store.savePlaying(store.loadPlaying()!!.copy(version = 12345))   // noted by another version of the app
-        assertFalse(startedAgain().player().playWhenReady)
+        assertFalse(startedAgain(carriesOn = false).player().playWhenReady)
     }
 
     /**

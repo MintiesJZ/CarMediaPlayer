@@ -47,7 +47,7 @@ key) and plays **only from a Navidrome server**.
 
 `tools/buildcheck` builds the app's sources with the same dependencies as
 `app/build.gradle` and runs the Robolectric tests in `tools/buildcheck/tests`
-(42 service tests, 25 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
+(43 service tests, 25 streaming tests, 3 for `LiveDownload`, 21 screenshot tests →
 `tools/buildcheck/app/build/shots`, 7 against a real Navidrome, skipped
 unless one is running: `tools/navidrome/README.md`, and 33 with the car's own
 launcher — 7 of them with SmartTube too — skipped unless their APKs are
@@ -204,6 +204,23 @@ are the main thread here.
   is shown).  The system kills the app to replace it; `BootReceiver` gets
   MY_PACKAGE_REPLACED and reopens the app, and resumes the music if it was
   playing — only when the updater started the install.
+- **Quiet while the car starts**: the launcher starts MediaService ~11 s
+  after the head unit boots and asks for the music at ~16 s, once the car's
+  adapter service (`com.saicmotor.caradapter`) has finished starting.  That
+  service hears the car's signals only from the vehicle HAL's one pass over
+  them ~15 s after boot (subscribing gets it no value), so if it subscribes
+  a few tenths of a second late it never hears them — among them
+  `ID_IMCU_VEHICLE_ELECTRIC_RANGE_DSP_CMD` (0x2140a1a5), which colours the
+  launcher's battery diagram: 0 green; anything else — the car's low-range
+  warning (1–3), or -1, "never heard" — orange, for the whole drive
+  (`BatterySeekBar.setEH32BatteryProgress`).  So the app does nothing heavy
+  until the launcher asks: 1.0 – 1.0.15 got the queue ready as soon as the
+  service was started (player, decoder and audio track, 12–15 s after boot),
+  the adapter service ran a second late and the launcher asked a second
+  later too — no sooner for the music, and an orange battery most days.
+  In a logcat: `LAU.EvBatteryView: onChargePercentChange: percent: 98,range=-1,…`
+  is orange, `range=0` green; `[CarAdapterSettingManager]
+  ID_IMCU_VEHICLE_ELECTRIC_RANGE_DSP_CMD = 0` is the signal being heard.
 
 ## Navidrome
 
@@ -288,6 +305,8 @@ are the main thread here.
   look-ahead finds the next song there instead of downloading it again.
 - Start-up restores the queue from a snapshot in device storage and plays
   without the network; in shuffle it starts at the first fully cached song.
+  It does so when the launcher asks, not before ("Quiet while the car
+  starts"); only woken from sleep is the queue got ready ahead, paused.
 - Start-up **always plays**, however the music was left at switch-off (the
   car pauses it itself when switched off, and the launcher then asks for
   "paused").  Only the "Don't play anything" setting, or another app
